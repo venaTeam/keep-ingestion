@@ -100,14 +100,32 @@ def _missing_required_tables(inspector) -> list:
     return [t for t in _SCHEMA_REQUIRED_TABLES if t not in existing]
 
 
+class AlembicVersionUnreadable(RuntimeError):
+    """`alembic_version` exists but this role may not read it.
+
+    Expected, not exceptional: the least-privilege grant this service is designed
+    for is `SELECT` on `tenant`, `tenantapikey` and `operator` — `alembic_version`
+    is deliberately not in it. Distinguished from "not stamped yet" (None) because
+    the two mean opposite things: None is "the gateway has not migrated", this is
+    "we are not allowed to look".
+    """
+
+
 def _gateway_alembic_head():
-    """Return the alembic revision currently stamped on the shared DB, or None if
-    keep-api-gateway has not created/stamped `alembic_version` yet."""
+    """Return the alembic revision currently stamped on the shared DB.
+
+    None if keep-api-gateway has not created/stamped `alembic_version` yet;
+    raises `AlembicVersionUnreadable` if the table is there but this role cannot
+    select from it.
+    """
     inspector = sa_inspect(engine)
     if "alembic_version" not in inspector.get_table_names():
         return None
-    with engine.connect() as conn:
-        row = conn.execute(text("SELECT version_num FROM alembic_version")).first()
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("SELECT version_num FROM alembic_version")).first()
+    except Exception as exc:
+        raise AlembicVersionUnreadable(str(exc)) from exc
     return row[0] if row else None
 
 
@@ -125,6 +143,20 @@ def schema_ready() -> tuple[bool, dict]:
     sleeping: the probe has its own timeout and is polled on its own schedule, so
     it must never block. Quiescence is not observable in a single call, so this
     checks the required tables plus — when pinned — the expected revision.
+
+    **The alembic head is optional here, and that is load-bearing.** The grant
+    this service is built for does not include `alembic_version`, so reading it
+    raises `InsufficientPrivilege`. Treating that as a failed check would report
+    NotReady on every poll under exactly the least-privilege configuration the
+    split exists to enable — the CrashLoopBackOff this function was written to
+    avoid, reintroduced through the other door. The revision is therefore reported
+    when readable and skipped when not.
+
+    Setting `KEEP_SCHEMA_EXPECTED_REVISION` is the one case that genuinely needs
+    it, so pinning a revision means also granting `SELECT ON alembic_version`. If
+    the pin is set and the table cannot be read, this reports NotReady rather than
+    silently ignoring the pin — a revision guard that quietly does nothing is
+    worse than one that fails loudly.
     """
     detail: dict = {"required_tables": _SCHEMA_REQUIRED_TABLES}
     try:
@@ -133,8 +165,19 @@ def schema_ready() -> tuple[bool, dict]:
             detail["missing_tables"] = missing
             return False, detail
 
-        head = _gateway_alembic_head()
-        detail["alembic_head"] = head
+        try:
+            head = _gateway_alembic_head()
+            detail["alembic_head"] = head
+        except AlembicVersionUnreadable as exc:
+            head = None
+            detail["alembic_head"] = "unreadable (no grant on alembic_version)"
+            if _SCHEMA_EXPECTED_REVISION:
+                detail["expected_revision"] = _SCHEMA_EXPECTED_REVISION
+                detail["error"] = (
+                    "KEEP_SCHEMA_EXPECTED_REVISION is set but alembic_version is "
+                    f"not readable by this role: {exc}"
+                )
+                return False, detail
 
         if _SCHEMA_EXPECTED_REVISION:
             detail["expected_revision"] = _SCHEMA_EXPECTED_REVISION
@@ -151,10 +194,22 @@ def schema_ready() -> tuple[bool, dict]:
 
 
 def _wait_for_schema():
-    """Block until keep-api-gateway has FINISHED provisioning the shared schema."""
+    """Block until keep-api-gateway has FINISHED provisioning the shared schema.
+
+    Quiescence of the gateway's alembic head is the primary signal, but it needs
+    `SELECT` on `alembic_version`, which the least-privilege grant deliberately
+    withholds. When the table is unreadable this degrades to requiring the three
+    tables to be present and stay present across `KEEP_SCHEMA_STABLE_CHECKS`
+    polls. That is a weaker guarantee — it cannot see a migration still adding
+    columns — and it is why `KEEP_SCHEMA_EXPECTED_REVISION` (plus a grant on
+    `alembic_version`) is the right setting for a deploy that wants the strong
+    one. Without this fallback the wait never returns under the very grant this
+    service is designed to run with, and the pod never finishes starting.
+    """
     deadline = time.monotonic() + _SCHEMA_WAIT_TIMEOUT
     last_head = None
     stable = 0
+    head_unreadable = False
     while True:
         if _abort_event.is_set():
             raise SchemaWaitAborted("schema wait aborted (shutdown requested)")
@@ -169,10 +224,49 @@ def _wait_for_schema():
                     missing,
                 )
                 head = None
+                head_is_unreadable = False
             else:
-                head = _gateway_alembic_head()
+                try:
+                    head = _gateway_alembic_head()
+                    head_is_unreadable = False
+                except AlembicVersionUnreadable as exc:
+                    head, head_is_unreadable = None, True
+                    unreadable_reason = exc
 
-            if head is not None and _SCHEMA_EXPECTED_REVISION:
+            if head_is_unreadable and _SCHEMA_EXPECTED_REVISION:
+                # The pin cannot be honoured without the grant. Keep waiting and
+                # say why, rather than starting against a schema whose revision
+                # was never actually checked.
+                last_head, stable = None, 0
+                logger.warning(
+                    "KEEP_SCHEMA_EXPECTED_REVISION is set but this role cannot "
+                    "read alembic_version (%s); grant SELECT on it or unset the "
+                    "pin",
+                    unreadable_reason,
+                )
+            elif head_is_unreadable:
+                # Degraded signal: the three tables are present, so count polls
+                # of them staying present instead of polls of a steady revision.
+                if not head_unreadable:
+                    head_unreadable = True
+                    logger.info(
+                        "alembic_version is not readable by this role (expected "
+                        "under the SELECT-only grant); falling back to "
+                        "required-table stability"
+                    )
+                stable += 1
+                if stable >= _SCHEMA_STABLE_CHECKS:
+                    logger.info(
+                        "DB schema is ready (required tables %s present and "
+                        "stable across %s checks)",
+                        _SCHEMA_REQUIRED_TABLES,
+                        stable,
+                    )
+                    return
+                logger.info(
+                    "Required tables present (%s/%s)", stable, _SCHEMA_STABLE_CHECKS
+                )
+            elif head is not None and _SCHEMA_EXPECTED_REVISION:
                 # An exact match beats quiescence: a stale head on a down
                 # gateway is perfectly quiescent, and this is what tells the
                 # two apart.
