@@ -1,4 +1,4 @@
-FROM python:3.11.6-slim as base
+FROM python:3.11.6-slim AS base
 
 ENV PYTHONFAULTHANDLER=1 \
     PYTHONHASHSEED=random \
@@ -19,7 +19,7 @@ COPY pyproject.toml poetry.lock ./
 RUN . /venv/bin/activate && poetry install --no-root
 
 # Setting the virtual environment path
-ENV PYTHONPATH="/app:${PYTHONPATH}"
+ENV PYTHONPATH="/app"
 ENV PATH="/venv/bin:${PATH}"
 ENV VIRTUAL_ENV="/venv"
 
@@ -30,6 +30,12 @@ ENV PROMETHEUS_MULTIPROC_DIR="/tmp/prometheus"
 # gateway's `alembic upgrade head` to settle rather than running one. The env var
 # is a second guard, so a mistaken call cannot touch the schema.
 ENV SKIP_DB_CREATION=true
+
+# Expose the HTTP port. One port only: the intake routes, both probes and the
+# Prometheus scrape are all served by the same app, unlike keep-event-handler,
+# which splits health (8092) and metrics (8094) across two servers because its
+# consumer has no HTTP app of its own.
+EXPOSE 8080
 
 # Copy application code
 COPY src /app/src

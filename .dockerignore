@@ -1,0 +1,14 @@
+# The Dockerfile copies `src/` wholesale; keep non-runtime files out of it.
+.git
+.gitignore
+.venv
+venv
+**/__pycache__
+**/*.py[cod]
+*.db
+tests
+benchmark
+.idea
+.vscode
+*.md
+!README.md
