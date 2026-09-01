@@ -79,6 +79,37 @@ LOG_FORMAT_DEVELOPMENT_TERMINAL = "dev_terminal"
 LOG_FORMAT = os.environ.get("LOG_FORMAT", LOG_FORMAT_OPEN_TELEMETRY)
 
 
+class OtelFieldsFilter(logging.Filter):
+    """Guarantee the OTEL correlation fields exist on every record.
+
+    `LoggingInstrumentor().instrument()` is what injects `otelTraceID` and its
+    siblings, and it runs inside the `KEEP_OTEL_ENABLED` block in
+    `observability.setup()`. With OTEL disabled nothing injects them, while the
+    `uvicorn_access` formatter interpolates `%(otelTraceID)s` unconditionally --
+    so every access log line raised `ValueError: Formatting field not found in
+    record` and was dropped. Logging swallows handler errors, so the symptom was
+    silently missing access logs plus a traceback on stderr, not a crash.
+
+    `DevTerminalFormatter` already defended itself this way and
+    `CustomJsonFormatter` emits nulls; only the plain `uvicorn_access` formatter
+    was exposed. A filter fixes it for every handler at once rather than leaving
+    the next formatter to rediscover it.
+    """
+
+    DEFAULTS = {
+        "otelTraceID": "-",
+        "otelSpanID": "-",
+        "otelTraceSampled": "-",
+        "otelServiceName": "-",
+    }
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        for field, default in self.DEFAULTS.items():
+            if not hasattr(record, field):
+                setattr(record, field, default)
+        return True
+
+
 class DevTerminalFormatter(logging.Formatter):
     def format(self, record):
         if not hasattr(record, "otelTraceID"):
@@ -206,13 +237,19 @@ CONFIG = {
             ),
             "class": "logging.StreamHandler",
             "stream": "ext://sys.stdout",
+            "filters": ["otel_fields"],
         },
         "uvicorn_access": {  # Add new handler for uvicorn.access
             "class": "logging.StreamHandler",
             "formatter": "uvicorn_access",
+            "filters": ["otel_fields"],
         },
     },
-    "filters": {},
+    "filters": {
+        # Runs before formatting, so the OTEL fields are present whether or not
+        # KEEP_OTEL_ENABLED is set. See OtelFieldsFilter.
+        "otel_fields": {"()": OtelFieldsFilter},
+    },
     "loggers": {
         "": {
             "handlers": ["default"],
