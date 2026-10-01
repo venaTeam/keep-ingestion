@@ -81,6 +81,7 @@ class AlertDto(BaseModel):
     name: str
     status: AlertStatus
     severity: AlertSeverity
+    time_created: str | None = None  # Provider firing time; fallback is applied in Event Handler.
     last_received: str = Field(default=None, alias="lastReceived")
     firing_start_time: str | None = Field(default=None, alias="firingStartTime")
     firing_start_time_since_last_resolved: str | None = Field(default=None, alias="firingStartTimeSinceLastResolved")

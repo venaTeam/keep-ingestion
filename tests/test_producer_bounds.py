@@ -18,6 +18,28 @@ from src.services.producers.base_event_handler import DLQ_TASK_NAME, MAIN_TASK_N
 from src.services.producers.kafka_producer import KafkaEventProducer
 
 
+@pytest.mark.asyncio
+async def test_payload_preserves_firing_time_and_adds_receive_time():
+    import json
+    from src.models.alert import AlertDto
+
+    producer = _producer()
+    producer._produce_with_retry = AsyncMock(return_value=MAIN_TASK_NAME)
+    event = AlertDto(name="test", time_created="2026-01-01T12:00:00+02:00")
+
+    await producer.produce(event, tenant_id="tenant", trace_id="trace")
+
+    payload = json.loads(producer._produce_with_retry.call_args.args[0])
+    assert payload["received_at"]
+    assert payload["event"]["time_created"] == "2026-01-01T12:00:00+02:00"
+
+
+def test_missing_firing_time_remains_available_for_event_handler_fallback():
+    from src.models.alert import AlertDto
+
+    assert AlertDto(name="test").time_created is None
+
+
 def _producer(**overrides):
     with patch("src.services.producers.kafka_producer.AIOKafkaProducer"):
         producer = KafkaEventProducer()
