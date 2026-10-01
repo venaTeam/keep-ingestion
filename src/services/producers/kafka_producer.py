@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 import json
 import logging
 import time
@@ -296,6 +297,7 @@ class KafkaEventProducer(EventProducer):
     def _build_payload(self, event: dict, event_type: EventType, **kwargs) -> dict:
         return {
             "event": event,
+            "received_at": datetime.now(timezone.utc).isoformat(),
             "event_type": event_type.value if hasattr(event_type, "value") else event_type,
             "tenant_id": kwargs.get("tenant_id"),
             "provider_type": kwargs.get("provider_type"),
