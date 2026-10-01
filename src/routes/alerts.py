@@ -2,8 +2,7 @@
 
 The three routes external senders reach, and nothing else. Every UI-facing alert
 endpoint stays on `keep-api-gateway`; this module is deliberately free of the
-enrichment, CEL, Elasticsearch and facet machinery those endpoints need, so the
-service keeps a read-only database role and a small dependency set.
+enrichment, CEL, Elasticsearch and facet machinery those endpoints need
 
 `POST /alerts/event` is the route Appchi is configured with and the one
 `GET /settings/webhook` advertises, so its request and response shapes are a
@@ -23,7 +22,6 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from src.models.alert import AlertDto
-from src.repositories.db import get_operator_by_name
 from src.repositories.dependencies import (
     GENERIC_TENANT_UUID,
     extract_generic_body,
@@ -122,38 +120,9 @@ def _publish_failed_response(
     )
 
 
-def _extract_operator(event) -> str | None:
-    """Best-effort read of the alert's `operator` routing key from an incoming
-    event, which may be a single AlertDto, a list, or a raw dict. For a batch we
-    use the first alert's operator (VENA-5596 Epic 5)."""
-    item = event[0] if isinstance(event, list) and event else event
-    if item is None:
-        return None
-    if isinstance(item, dict):
-        return item.get("operator")
-    return getattr(item, "operator", None)
-
 
 def _resolve_ingestion_tenant(event) -> str:
-    """Route an alert to the tenant that owns its `operator`. An alert with no
-    operator, or an operator that maps to no tenant, goes to the GENERAL tenant --
-    NOT the ingesting key's tenant -- so a specific tenant only ever receives its
-    own operators' alerts (VENA-5596 Epic 5)."""
-    operator_name = _extract_operator(event)
-    if not operator_name:
-        return GENERIC_TENANT_UUID
-    operator = get_operator_by_name(operator_name)
-    if operator is None:
-        logger.info(
-            "Alert operator matched no tenant; routing to general",
-            extra={"operator": operator_name, "tenant_id": GENERIC_TENANT_UUID},
-        )
-        return GENERIC_TENANT_UUID
-    logger.info(
-        "Routing alert by operator",
-        extra={"operator": operator_name, "tenant_id": operator.tenant_id},
-    )
-    return operator.tenant_id
+    return os.environ.get("KEEP_INGESTION_TENANT_ID") or GENERIC_TENANT_UUID
 
 
 @router.post(
@@ -180,9 +149,6 @@ async def receive_generic_event(
         bg_tasks (BackgroundTasks): Background tasks handler.
         tenant_id (str, optional): Defaults to Depends(verify_api_key).
     """
-    # Route by operator: an alert whose operator maps to a tenant goes there,
-    # else it goes to the GENERAL tenant (never the API-key's tenant), so a
-    # specific tenant only receives its own operators' alerts (VENA-5596 Epic 5).
     tenant_id = _resolve_ingestion_tenant(event)
     # Use the abstract event producer (Redis or Kafka)
     try:
@@ -269,9 +235,6 @@ async def receive_event(
     # We do NOT parse the event here anymore, we pass the raw body (event) to the worker
     # We do NOT resolve the provider here anymore, we pass the provider_name to the worker
 
-    # Route by operator: an alert whose operator maps to a tenant goes there,
-    # else it goes to the GENERAL tenant (never the API-key's tenant), so a
-    # specific tenant only receives its own operators' alerts (VENA-5596 Epic 5).
     tenant_id = _resolve_ingestion_tenant(event)
     # Use the abstract event producer (Redis or Kafka)
     try:

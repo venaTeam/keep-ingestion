@@ -3,11 +3,6 @@
 Three routers, matching the service's whole reason to exist: alert intake, the
 probes Kubernetes reads, and the Prometheus scrape. Everything else the gateway
 mounts is UI-facing and stays there.
-
-Notably absent are `operators` and `tenants`. Operator-based routing happens on
-the intake path — `_resolve_ingestion_tenant` reads the `operator` table — but
-managing operators is admin CRUD that belongs with the API service, and mounting
-it here would need write access to a table this service only ever reads.
 """
 
 from fastapi import FastAPI
