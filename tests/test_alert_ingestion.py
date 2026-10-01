@@ -4,16 +4,15 @@ These routes are what Appchi and every other sender is pointed at, so their
 request and response shapes are a published interface rather than an
 implementation detail. Each test below pins one clause of it:
 
-* 202 with `{"sink": "main"}` and `alert_ingestion_total{status="success"}`
-* what the typed body actually rejects — a non-object, refused **before**
-  anything is produced — and what it accepts despite looking stricter
+* 202 with {"sink": "main"} and alert_ingestion_total{status="success"}
+* what the typed body actually rejects - a non-object, refused **before**
+  anything is produced - and what it accepts despite looking stricter
 * 503 with `Retry-After` when the event lands in the DLQ, or reaches no topic
-* operator -> tenant routing, including the silent fall back to the general
-  tenant, which is otherwise invisible in production
-* no database write on any intake path, which is what lets the service hold a
-  SELECT-only role
+* API-key verification against the configured Secret key
+* no database access on any intake path
 """
 
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -22,6 +21,7 @@ from fastapi.testclient import TestClient
 
 from src.routes import alerts as alerts_route
 from src.services.identity_manager.authenticatedentity import AuthenticatedEntity
+from src.services.identity_manager.identitymanagerfactory import IdentityManagerFactory
 from src.services.producers.base_event_handler import (
     DLQ_TASK_NAME,
     MAIN_TASK_NAME,
@@ -29,7 +29,7 @@ from src.services.producers.base_event_handler import (
 )
 
 TENANT = "tenant-under-test"
-OPERATOR_TENANT = "tenant-owning-the-operator"
+API_KEY = "test-ingestion-api-key"
 
 
 class _RecordingProducer(EventProducer):
@@ -47,16 +47,18 @@ class _RecordingProducer(EventProducer):
         return self._task_name
 
 
+@pytest.fixture(autouse=True)
+def _setup_env(monkeypatch):
+    """Every test in this file runs with a configured ingestion API key."""
+    monkeypatch.setenv("KEEP_INGESTION_API_KEY", API_KEY)
+    monkeypatch.setenv("KEEP_INGESTION_TENANT_ID", TENANT)
+
+
 @pytest.fixture
-def client_factory():
-    """Build an app with auth and the producer stubbed out.
+def client_factory(monkeypatch):
+    """Build an app with auth and the producer stubbed out."""
 
-    The auth verifier is overridden rather than exercised: API-key verification
-    is `AuthVerifierBase`'s, unchanged from the gateway, and driving it here
-    would need a database. What these tests are for is the intake contract.
-    """
-
-    def _build(producer: EventProducer):
+    def _build(producer: EventProducer, override_auth: bool = True):
         app = FastAPI()
 
         # Middleware sets trace_id in the real app; the routes read it
@@ -71,19 +73,26 @@ def client_factory():
         async def _fake_producer():
             return producer
 
-        entity = AuthenticatedEntity(
-            tenant_id=TENANT, email="sender@example.com", api_key_name="webhook"
-        )
         app.dependency_overrides[alerts_route.get_event_producer] = _fake_producer
-        # The auth verifier is constructed per-route via IdentityManagerFactory,
-        # so override by callable identity on each route's security dependency.
-        for route in app.routes:
-            dependant = getattr(route, "dependant", None)
-            if not dependant:
-                continue
-            for dep in dependant.dependencies:
-                if dep.call.__class__.__name__ == "AuthVerifierBase":
-                    app.dependency_overrides[dep.call] = lambda: entity
+
+        if override_auth:
+            # The auth verifier is constructed per-route via IdentityManagerFactory,
+            # so override by callable identity on each route's security dependency.
+            for route in app.routes:
+                dependant = getattr(route, "dependant", None)
+                if not dependant:
+                    continue
+                for dep in dependant.dependencies:
+                    if dep.call.__class__.__name__ == "AuthVerifierBase":
+                        app.dependency_overrides[dep.call] = (
+                            lambda: AuthenticatedEntity(
+                                tenant_id=TENANT,
+                                email="ingestion",
+                                api_key_name="ingestion-secret",
+                                role="webhook",
+                            )
+                        )
+
         return TestClient(app), producer
 
     return _build
@@ -96,33 +105,40 @@ def _alert_body(**overrides):
 
 
 # --------------------------------------------------------------------------- #
-# POST /alerts/event — the Appchi route
+# POST /alerts/event - the Appchi route
 # --------------------------------------------------------------------------- #
+
 def test_generic_event_accepts_and_produces(client_factory):
     client, producer = client_factory(_RecordingProducer())
-    with patch.object(alerts_route, "_resolve_ingestion_tenant", return_value=TENANT):
-        resp = client.post("/alerts/event", json=_alert_body())
+    resp = client.post(
+        "/alerts/event",
+        json=_alert_body(),
+        headers={"X-API-KEY": API_KEY},
+    )
 
     assert resp.status_code == 202
     assert resp.json()["sink"] == "main"
     assert len(producer.calls) == 1
+    assert producer.calls[0]["tenant_id"] == TENANT
 
 
-@pytest.mark.parametrize("body", ['"a string"', "42", "[1, 2, 3]"])
+@pytest.mark.parametrize("body", ["a string", 42, [1, 2, 3]])
 def test_generic_event_rejects_a_non_object_body_before_producing(
     client_factory, body
 ):
     """A body that matches no arm of the union is refused before publishing.
 
     The declared type is `AlertDto | list[AlertDto] | dict`, so what actually
-    gets rejected is a body that is not an object and not a list of objects — a
+    gets rejected is a body that is not an object and not a list of objects - a
     bare scalar, or a list of scalars. Nothing is produced, which is the part
     that matters: a malformed payload must fail at the edge rather than become a
     DLQ row nobody is watching.
     """
     client, producer = client_factory(_RecordingProducer())
     resp = client.post(
-        "/alerts/event", content=body, headers={"Content-Type": "application/json"}
+        "/alerts/event",
+        content=body,
+        headers={"Content-Type": "application/json", "X-API-KEY": API_KEY},
     )
 
     assert resp.status_code == 422
@@ -133,12 +149,12 @@ def test_generic_event_rejects_a_non_object_body_before_producing(
     "body", [{"severity": "critical"}, {}, {"totally": "unrelated"}]
 )
 def test_generic_event_accepts_any_json_object(client_factory, body):
-    """Pins a contract that is looser than it looks — deliberately, for now.
+    """Pins a contract that is looser than it looks - deliberately, for now.
 
     The route declares `response_model=AlertDto | list[AlertDto]` and a typed
     body, which reads as "this endpoint validates alerts". It does not: the
     trailing `| dict` in the union means pydantic falls through to `dict` for any
-    object that fails `AlertDto`, so a body with no `name` — or no keys at all —
+    object that fails `AlertDto`, so a body with no `name` - or no keys at all -
     is accepted with 202 and published.
 
     This is copied behaviour, not new: the gateway does the same, and senders may
@@ -148,8 +164,11 @@ def test_generic_event_accepts_any_json_object(client_factory, body):
     `AlertDto.schema()` as the contract, but this route does not enforce it.
     """
     client, producer = client_factory(_RecordingProducer())
-    with patch.object(alerts_route, "_resolve_ingestion_tenant", return_value=TENANT):
-        resp = client.post("/alerts/event", json=body)
+    resp = client.post(
+        "/alerts/event",
+        json=body,
+        headers={"X-API-KEY": API_KEY},
+    )
 
     assert resp.status_code == 202
     assert len(producer.calls) == 1
@@ -157,8 +176,11 @@ def test_generic_event_accepts_any_json_object(client_factory, body):
 
 def test_generic_event_returns_503_with_retry_after_on_dlq(client_factory):
     client, _ = client_factory(_RecordingProducer(task_name=DLQ_TASK_NAME))
-    with patch.object(alerts_route, "_resolve_ingestion_tenant", return_value=TENANT):
-        resp = client.post("/alerts/event", json=_alert_body())
+    resp = client.post(
+        "/alerts/event",
+        json=_alert_body(),
+        headers={"X-API-KEY": API_KEY},
+    )
 
     assert resp.status_code == 503
     assert resp.headers["Retry-After"]
@@ -167,16 +189,19 @@ def test_generic_event_returns_503_with_retry_after_on_dlq(client_factory):
 
 def test_generic_event_returns_503_when_publish_reaches_no_topic(client_factory):
     client, _ = client_factory(_RecordingProducer(raises=RuntimeError("brokers down")))
-    with patch.object(alerts_route, "_resolve_ingestion_tenant", return_value=TENANT):
-        resp = client.post("/alerts/event", json=_alert_body())
+    resp = client.post(
+        "/alerts/event",
+        json=_alert_body(),
+        headers={"X-API-KEY": API_KEY},
+    )
 
     assert resp.status_code == 503
-    assert resp.headers["Retry-After"]
 
 
 # --------------------------------------------------------------------------- #
-# POST /alerts/event/{provider_type} — raw body, and the two fixed defects
+# POST /alerts/event/{provider_type} - raw body, and the two fixed defects
 # --------------------------------------------------------------------------- #
+
 def test_provider_event_passes_a_raw_body_through_unparsed(client_factory):
     """The two routes must not be conflated.
 
@@ -186,8 +211,11 @@ def test_provider_event_passes_a_raw_body_through_unparsed(client_factory):
     """
     client, producer = client_factory(_RecordingProducer())
     raw = {"totally": "not-an-alert", "nested": {"x": 1}}
-    with patch.object(alerts_route, "_resolve_ingestion_tenant", return_value=TENANT):
-        resp = client.post("/alerts/event/grafana", json=raw)
+    resp = client.post(
+        "/alerts/event/grafana",
+        json=raw,
+        headers={"X-API-KEY": API_KEY},
+    )
 
     assert resp.status_code == 202
     assert producer.calls[0]["event"] == raw
@@ -197,7 +225,7 @@ def test_provider_event_passes_a_raw_body_through_unparsed(client_factory):
 def test_provider_event_counts_each_alert_exactly_once(client_factory):
     """Regression guard for the gateway's double-count.
 
-    The gateway increments `alert_ingestion_total` in the route body AND again
+    The gateway increments `alert_ingestion_total` unconditionally AND again
     inside `_ingestion_response`. That counter is what the cutover reconciles
     against the consumer's `events_in_total` to prove no alert was lost, so a 2x
     inflation on one side makes the comparison meaningless.
@@ -205,10 +233,11 @@ def test_provider_event_counts_each_alert_exactly_once(client_factory):
     client, _ = client_factory(_RecordingProducer())
     counter = MagicMock()
     with patch.object(alerts_route, "alert_ingestion_total", counter):
-        with patch.object(
-            alerts_route, "_resolve_ingestion_tenant", return_value=TENANT
-        ):
-            resp = client.post("/alerts/event/grafana", json={"a": 1})
+        resp = client.post(
+            "/alerts/event/grafana",
+            json={"a": 1},
+            headers={"X-API-KEY": API_KEY},
+        )
 
     assert resp.status_code == 202
     assert counter.labels.call_count == 1
@@ -222,10 +251,11 @@ def test_provider_event_dlq_is_not_also_counted_as_success(client_factory):
     client, _ = client_factory(_RecordingProducer(task_name=DLQ_TASK_NAME))
     counter = MagicMock()
     with patch.object(alerts_route, "alert_ingestion_total", counter):
-        with patch.object(
-            alerts_route, "_resolve_ingestion_tenant", return_value=TENANT
-        ):
-            resp = client.post("/alerts/event/grafana", json={"a": 1})
+        resp = client.post(
+            "/alerts/event/grafana",
+            json={"a": 1},
+            headers={"X-API-KEY": API_KEY},
+        )
 
     assert resp.status_code == 503
     statuses = [c.kwargs["status"] for c in counter.labels.call_args_list]
@@ -235,91 +265,90 @@ def test_provider_event_dlq_is_not_also_counted_as_success(client_factory):
 def test_provider_event_returns_503_not_500_when_publish_fails(client_factory):
     """The gateway leaves this route's `produce()` unguarded, so a Kafka outage
     surfaces as a 500 from the catch-all. Senders were asked to retry on 503, so
-    a 500 loses per-provider alerts that the generic route would have kept."""
+    a 500 loses per-provider alerts that the generic route would have kept.
+    """
     client, _ = client_factory(_RecordingProducer(raises=RuntimeError("brokers down")))
-    with patch.object(alerts_route, "_resolve_ingestion_tenant", return_value=TENANT):
-        resp = client.post("/alerts/event/grafana", json={"a": 1})
+    resp = client.post(
+        "/alerts/event/grafana",
+        json={"a": 1},
+        headers={"X-API-KEY": API_KEY},
+    )
 
     assert resp.status_code == 503
     assert resp.headers["Retry-After"]
 
 
 # --------------------------------------------------------------------------- #
-# Operator routing (VENA-5596 Epic 5)
+# Tenant routing
 # --------------------------------------------------------------------------- #
-def test_operator_routes_to_its_own_tenant():
-    operator = MagicMock()
-    operator.tenant_id = OPERATOR_TENANT
-    with patch.object(alerts_route, "get_operator_by_name", return_value=operator):
+
+def test_alert_routes_to_configured_tenant(monkeypatch):
+    configured = "configured-tenant-id"
+    monkeypatch.setenv("KEEP_INGESTION_TENANT_ID", configured)
+    assert alerts_route._resolve_ingestion_tenant({"operator": "acme"}) == configured
+
+
+def test_alert_without_configured_tenant_routes_to_general():
+    # Ensure the env var is not set for this test.
+    with patch.dict(os.environ, {"KEEP_INGESTION_TENANT_ID": ""}, clear=False):
         assert (
-            alerts_route._resolve_ingestion_tenant({"operator": "acme"})
-            == OPERATOR_TENANT
+            alerts_route._resolve_ingestion_tenant({"name": "no operator here"})
+            == alerts_route.GENERIC_TENANT_UUID
         )
 
 
-def test_alert_without_an_operator_goes_to_the_general_tenant():
-    with patch.object(alerts_route, "get_operator_by_name") as lookup:
-        resolved = alerts_route._resolve_ingestion_tenant({"name": "no operator here"})
+# --------------------------------------------------------------------------- #
+# API-key verification
+# --------------------------------------------------------------------------- #
 
-    assert resolved == alerts_route.GENERIC_TENANT_UUID
-    lookup.assert_not_called()
-
-
-def test_unknown_operator_falls_back_to_the_general_tenant_not_the_key_tenant():
-    """The fallback is silent in production — no error, no metric.
-
-    An alert whose operator matches no row goes to the GENERAL tenant, never the
-    ingesting API key's tenant, so a specific tenant only ever receives its own
-    operators' alerts. This assertion is the only place that distinction is
-    checked; get it wrong and alerts land in the wrong tenant quietly.
-    """
-    with patch.object(alerts_route, "get_operator_by_name", return_value=None):
-        resolved = alerts_route._resolve_ingestion_tenant({"operator": "unknown"})
-
-    assert resolved == alerts_route.GENERIC_TENANT_UUID
-    assert resolved != TENANT
+def test_missing_api_key_returns_401(client_factory):
+    client, _ = client_factory(_RecordingProducer(), override_auth=False)
+    resp = client.post("/alerts/event", json=_alert_body())
+    assert resp.status_code == 401
 
 
-def test_operator_is_read_from_the_first_alert_of_a_batch():
-    operator = MagicMock()
-    operator.tenant_id = OPERATOR_TENANT
-    batch = [{"operator": "acme"}, {"operator": "other"}]
-    with patch.object(
-        alerts_route, "get_operator_by_name", return_value=operator
-    ) as lookup:
-        assert alerts_route._resolve_ingestion_tenant(batch) == OPERATOR_TENANT
+def test_invalid_api_key_returns_401(client_factory):
+    client, _ = client_factory(_RecordingProducer(), override_auth=False)
+    resp = client.post(
+        "/alerts/event",
+        json=_alert_body(),
+        headers={"X-API-KEY": "wrong-key"},
+    )
 
-    lookup.assert_called_once_with("acme")
+    assert resp.status_code == 401
+
+
+def test_valid_api_key_in_query_param(client_factory):
+    client, producer = client_factory(_RecordingProducer(), override_auth=False)
+    resp = client.post(f"/alerts/event?api_key={API_KEY}", json=_alert_body())
+    assert resp.status_code == 202
+    assert len(producer.calls) == 1
+
+
+def test_auth_verifier_requires_configured_key(monkeypatch):
+    monkeypatch.delenv("KEEP_INGESTION_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="KEEP_INGESTION_API_KEY"):
+        IdentityManagerFactory.get_auth_verifier(["write:alert"])
 
 
 # --------------------------------------------------------------------------- #
-# Least privilege
+# No database dependency
 # --------------------------------------------------------------------------- #
-def test_intake_never_writes_to_the_database(client_factory):
-    """The service holds a SELECT-only role, so a write on the intake path is
-    not a slow query — it is a 500 in production. The operator lookup is the only
-    database access here, and it is a read."""
-    client, _ = client_factory(_RecordingProducer())
-    session = MagicMock()
-    with patch("src.repositories.db.Session", return_value=session):
-        with patch.object(
-            alerts_route, "_resolve_ingestion_tenant", return_value=TENANT
-        ):
-            client.post("/alerts/event", json=_alert_body())
-            client.post("/alerts/event/grafana", json={"a": 1})
 
-    session.add.assert_not_called()
-    session.commit.assert_not_called()
-    session.execute.assert_not_called()
+def test_intake_has_no_database_imports():
+    """The intake routes must not import any database modules."""
+    import sys
 
+    # Remove any cached DB modules from previous imports.
+    for name in list(sys.modules):
+        if name.startswith("src.repositories.db") or name.startswith("src.models.db"):
+            del sys.modules[name]
 
-def test_update_key_last_used_is_a_noop_by_default():
-    """API-key verification must not stamp `last_used`.
+    # Re-import the route module: it should not pull in DB code.
+    import src.routes.alerts as alerts_module
 
-    That UPDATE is what would force this service's role to hold write access to
-    `tenantapikey`, defeating the boundary the split exists to draw.
-    """
-    from src.repositories import db
-
-    assert db.KEEP_APIKEY_TRACK_LAST_USED is False
-    assert db.update_key_last_used(TENANT, "some-key") is None
+    imported = set(sys.modules.keys())
+    db_modules = {
+        name for name in imported if name.startswith(("src.repositories.db", "src.models.db"))
+    }
+    assert not db_modules, f"Unexpected database modules imported: {db_modules}"

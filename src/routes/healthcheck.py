@@ -25,10 +25,6 @@ judgements are levered:
   probe answer "not ready" rather than hang and tie up a worker slot. The checks
   run in sequence, so the endpoint's worst case is twice this; keep it under the
   probe's own `timeoutSeconds` or kubelet cuts the connection first.
-
-`db`, `db_on_start` and `factory` are imported as modules rather than names, so
-each check stays late-bound to whatever the module currently holds. The router is
-mounted without a prefix, so both paths are absolute.
 """
 
 import asyncio
@@ -36,9 +32,7 @@ import logging
 import os
 
 from fastapi import APIRouter, Response
-from sqlalchemy import text
 
-from src.repositories import db, db_on_start
 from src.services.producers import factory
 
 logger = logging.getLogger(__name__)
@@ -58,45 +52,6 @@ def healthcheck() -> dict:
         dict: empty JSON object
     """
     return {}
-
-
-def _check_db() -> tuple[bool, dict]:
-    """DB reachable, and the schema keep-api-gateway owns is present.
-
-    **Deliberately not the gateway's `schema_at_head()`.** That compares the
-    database's stamped `alembic_version` against the migration scripts in the
-    image; this image ships none, so the comparison has nothing to match and
-    would report "not at head" on every poll, forever. Because `/readyz` gates
-    the **startupProbe**, that failure mode is CrashLoopBackOff rather than a bad
-    response — the pod never finishes starting.
-
-    `schema_ready()` asks the question this service actually has: are the three
-    tables it reads present, and (when `KEEP_SCHEMA_EXPECTED_REVISION` pins one)
-    is the gateway at the expected revision.
-    """
-    try:
-        with db.engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-    except Exception as exc:
-        logger.error("Database connectivity check failed: %s", exc)
-        return False, {"reachable": False, "error": f"{type(exc).__name__}: {exc}"}
-
-    try:
-        ready, schema_detail = db_on_start.schema_ready()
-    except Exception as exc:
-        logger.error("Database schema check failed with exception: %s", exc, exc_info=True)
-        return False, {
-            "reachable": True,
-            "schema_ready": False,
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-
-    detail = {"reachable": True, "schema_ready": ready, **schema_detail}
-    if not ready:
-        logger.warning("Database schema is not ready yet: %s", schema_detail)
-    else:
-        logger.info("Database readiness check passed: %s", schema_detail)
-    return ready, detail
 
 
 async def _check_producer() -> tuple[bool, dict]:
@@ -163,7 +118,7 @@ async def _bounded(awaitable, name: str) -> tuple[bool, dict]:
 
 @router.get(
     "/readyz",
-    description="Readiness: DB reachable and at head, Kafka producer connected",
+    description="Readiness: Kafka producer connected",
 )
 async def readyz(response: Response) -> dict:
     checks = {}
@@ -176,7 +131,7 @@ async def readyz(response: Response) -> dict:
     producer_ok, checks["producer"] = await _bounded(_check_producer(), "producer")
     checks["producer"]["required"] = REQUIRE_PRODUCER
 
-    ready = db_ok and (producer_ok or not REQUIRE_PRODUCER)
+    ready = producer_ok or not REQUIRE_PRODUCER
 
     if not producer_ok and not REQUIRE_PRODUCER:
         # Otherwise the lever hides the thing it was flipped for, and the pod
@@ -190,18 +145,6 @@ async def readyz(response: Response) -> dict:
     if not ready:
         response.status_code = 503
         reasons = []
-        if not db_ok:
-            db_detail = checks["database"]
-            if db_detail.get("error"):
-                reasons.append(f"database ({db_detail['error']})")
-            elif not db_detail.get("reachable", True):
-                reasons.append("database unreachable")
-            elif not db_detail.get("at_head", True):
-                reasons.append(
-                    f"database schema behind (db={db_detail.get('db_revision')}, head={db_detail.get('script_head')})"
-                )
-            else:
-                reasons.append("database unhealthy")
 
         if REQUIRE_PRODUCER and not producer_ok:
             prod_detail = checks["producer"]

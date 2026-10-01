@@ -127,26 +127,12 @@ def _clear_prometheus_multiproc_dir():
 
 def on_starting(server=None):
     """This function is called by the gunicorn server when it starts.
-
     Runs in the gunicorn master, before workers fork and before the socket binds.
-
-    Where the gateway calls `init_services()` — which runs `alembic upgrade head`
-    and provisions dashboards, providers and tenants — this service **waits** for
-    the gateway to have finished doing that. It ships no migrations and owns no
-    provisioning. `SKIP_DB_CREATION=true` is set as a second guard, so even a
-    mistaken call here cannot touch the schema.
-
-    The wait retries indefinitely rather than raising: a gateway still migrating
-    must make this service slow to start, not crash it, and the startupProbe
-    budget is what decides when to give up on the pod.
     """
     # Must run in the master before workers fork so we never delete a live
     # worker's files.
     _clear_prometheus_multiproc_dir()
 
-    from src.repositories.db_on_start import migrate_db
-
-    migrate_db()
 
 
 def post_worker_init(worker):
