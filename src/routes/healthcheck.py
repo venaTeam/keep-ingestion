@@ -123,11 +123,6 @@ async def _bounded(awaitable, name: str) -> tuple[bool, dict]:
 async def readyz(response: Response) -> dict:
     checks = {}
 
-    # _check_db blocks on socket + DB work; inline it would park this worker's
-    # event loop on every probe for as long as a sick Postgres takes to answer.
-    db_ok, checks["database"] = await _bounded(
-        asyncio.to_thread(_check_db), "database"
-    )
     producer_ok, checks["producer"] = await _bounded(_check_producer(), "producer")
     checks["producer"]["required"] = REQUIRE_PRODUCER
 

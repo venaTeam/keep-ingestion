@@ -12,6 +12,7 @@ implementation detail. Each test below pins one clause of it:
 * no database access on any intake path
 """
 
+import json
 import os
 from unittest.mock import MagicMock, patch
 
@@ -137,7 +138,7 @@ def test_generic_event_rejects_a_non_object_body_before_producing(
     client, producer = client_factory(_RecordingProducer())
     resp = client.post(
         "/alerts/event",
-        content=body,
+        content=json.dumps(body),
         headers={"Content-Type": "application/json", "X-API-KEY": API_KEY},
     )
 
