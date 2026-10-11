@@ -6,16 +6,6 @@ from src.config.core import config
 
 load_dotenv(find_dotenv())
 RUNNING_IN_CLOUD_RUN = os.environ.get("K_SERVICE") is not None
-DB_CONNECTION_STRING = config("DATABASE_CONNECTION_STRING", default=None)  # pylint: disable=invalid-name
-DB_POOL_SIZE = config("DATABASE_POOL_SIZE", default=5, cast=int)  # pylint: disable=invalid-name
-DB_MAX_OVERFLOW = config("DATABASE_MAX_OVERFLOW", default=10, cast=int)  # pylint: disable=invalid-name
-DB_ECHO = config("DATABASE_ECHO", default=False, cast=bool)  # pylint: disable=invalid-name
-KEEP_FORCE_CONNECTION_STRING = config(
-    "KEEP_FORCE_CONNECTION_STRING", default=False, cast=bool
-)  # pylint: disable=invalid-name
-KEEP_DB_PRE_PING_ENABLED = config("KEEP_DB_PRE_PING_ENABLED", default=True, cast=bool)  # pylint: disable=invalid-name
-DB_POOL_RECYCLE = config("DATABASE_POOL_RECYCLE", default=300, cast=int)  # pylint: disable=invalid-name
-DB_POOL_TIMEOUT = config("DATABASE_POOL_TIMEOUT", default=10, cast=int)  # pylint: disable=invalid-name
 PROVIDER_PULL_INTERVAL_MINUTE = int(
     os.environ.get("KEEP_PULL_INTERVAL", 10080)
 )  # maximum once a week

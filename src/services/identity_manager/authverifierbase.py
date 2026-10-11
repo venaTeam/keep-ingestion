@@ -1,5 +1,6 @@
-import datetime
+import hmac
 import logging
+import os
 from typing import Optional
 
 from fastapi import Depends, HTTPException, Request, Security
@@ -10,13 +11,10 @@ from fastapi.security import (
     OAuth2PasswordBearer,
 )
 from starlette.datastructures import FormData
-from sqlmodel import Session
 
 from src.config.core import config
-from src.repositories.db import get_api_key, get_session, update_key_last_used
 from src.repositories.dependencies import extract_generic_body
 from src.services.identity_manager.authenticatedentity import AuthenticatedEntity
-from src.services.identity_manager.rbac import Admin as AdminRole
 from src.services.identity_manager.rbac import get_role_by_role_name
 
 auth_header = APIKeyHeader(name="X-API-KEY", scheme_name="API Key", auto_error=False)
@@ -43,25 +41,17 @@ def get_all_scopes() -> list[str]:
 
 class AuthVerifierBase:
     """
-    Base class for authentication and authorization verification.
+    API-key authentication for `keep-ingestion`.
 
-    This class provides a framework for implementing authentication and authorization
-    in FastAPI applications. It supports multiple authentication methods including
-    API keys, HTTP Basic Auth, and OAuth2 bearer tokens.
+    The gateway's version supports bearer tokens and database-backed API keys.
+    This service is the public alert intake: it accepts exactly one credential
+    type, a single API key supplied through an OpenShift Secret, and resolves it
+    to a configured tenant. There is no database access, no user provisioning,
+    and no interactive login.
 
-    Subclasses can override the following methods to customize the authentication
-    and authorization process:
-    - _verify_bearer_token: Implement token-based authentication
-    - _verify_api_key: Customize API key verification
-    - _authorize: Implement custom authorization logic
-
-    The main entry point is the __call__ method, which handles the entire
-    authentication and authorization flow.
-
-    Attributes:
-        scopes (list[str]): A list of required scopes for authorization.
-        logger (logging.Logger): Logger for this class.
-
+    The key is read from `KEEP_INGESTION_API_KEY` (required). The tenant it
+    resolves to is read from `KEEP_INGESTION_TENANT_ID` and defaults to the
+    GENERAL tenant constant used by the rest of the ingestion path.
     """
 
     def __init__(self, scopes: list[str] = [], tenant_id: Optional[str] = None) -> None:
@@ -69,31 +59,23 @@ class AuthVerifierBase:
         self.scopes = scopes
         self.tenant_id = tenant_id
         self.logger = logging.getLogger(__name__)
-        self.impersonation_enabled = (
-            config("KEEP_IMPERSONATION_ENABLED", default="false") == "true"
-        )
-        self.impersonation_user_header = config(
-            "KEEP_IMPERSONATION_USER_HEADER", default="X-KEEP-USER"
-        )
-        self.impersonation_role_header = config(
-            "KEEP_IMPERSONATION_ROLE_HEADER", default="X-KEEP-ROLE"
-        )
-        self.impersonation_auto_provision = (
-            config("KEEP_IMPERSONATION_AUTO_PROVISION", default="false") == "true"
-        )
-        # hold a cache of the last time an API key was used
-        # the key is the f{tenant_id}:{reference_id} and the value is the last time it was updated
-        self.update_key_interval = config("KEEP_UPDATE_KEY_INTERVAL", default=60)
-        self.key_last_used_updates = {}
-        # check if read only instance
-        self.read_only = config("KEEP_READ_ONLY", default="false") == "true"
-        self.read_only_bypass_keys = config("KEEP_READ_ONLY_BYPASS_KEY", default="")
-        self.read_only_bypass_keys = self.read_only_bypass_keys.split(",")
-        # if read_only is enabled, read_only_bypass_key must be set
-        if self.read_only and not self.read_only_bypass_keys:
+        self._api_key = config("KEEP_INGESTION_API_KEY", default=None)
+        if not self._api_key:
             raise ValueError(
-                "KEEP_READ_ONLY_BYPASS_KEY must be set if KEEP_READ_ONLY is enabled"
+                "KEEP_INGESTION_API_KEY is required. Mount it from the OpenShift Secret."
             )
+        self._tenant_id = (
+            config("KEEP_INGESTION_TENANT_ID", default=None)
+            or tenant_id
+            or self._default_tenant_id()
+        )
+
+    @staticmethod
+    def _default_tenant_id() -> str:
+        # Imported lazily to avoid a circular import at module load time.
+        from src.repositories.dependencies import GENERIC_TENANT_UUID
+
+        return GENERIC_TENANT_UUID
 
     def __call__(
         self,
@@ -102,7 +84,6 @@ class AuthVerifierBase:
         authorization: Optional[HTTPAuthorizationCredentials] = Security(http_basic),
         token: Optional[str] = Depends(oauth2_scheme),
         body: dict | bytes | FormData = Depends(extract_generic_body),
-        session: Session = Depends(get_session),
     ) -> AuthenticatedEntity:
         """
         Main entry point for authentication and authorization.
@@ -111,7 +92,7 @@ class AuthVerifierBase:
             request (Request): The incoming request.
             api_key (Optional[str]): The API key from the header.
             authorization (Optional[HTTPAuthorizationCredentials]): The HTTP basic auth credentials.
-            token (Optional[str]): The OAuth2 token.
+            token (Optional[str]): The OAuth2 token (not supported here).
 
         Returns:
             AuthenticatedEntity: The authenticated entity.
@@ -120,14 +101,6 @@ class AuthVerifierBase:
             HTTPException: If authentication or authorization fails.
         """
         self.logger.debug("Starting authentication process")
-        if self.read_only and api_key not in self.read_only_bypass_keys:
-            # check if the scopes have scopes other than only read
-            if any([scope.split(":")[0] != "read" for scope in self.scopes]):
-                self.logger.error("Read only instance, but non-read scopes requested")
-                raise HTTPException(
-                    status_code=403,
-                    detail="Read only instance, but non-read scopes requested",
-                )
 
         authenticated_entity = self.authenticate(
             request,
@@ -135,7 +108,6 @@ class AuthVerifierBase:
             authorization,
             token,
             body=body,
-            session=session,
         )
         self.logger.debug(
             f"Authentication successful for entity: {authenticated_entity}"
@@ -154,36 +126,18 @@ class AuthVerifierBase:
         authorization: Optional[HTTPAuthorizationCredentials],
         token: Optional[str],
         body: Optional[dict | bytes | FormData] = None,
-        session: Optional[Session] = None,
     ) -> AuthenticatedEntity:
         """
-        Authenticate the request using either token, API key, or HTTP basic auth.
+        Authenticate the request using the configured ingestion API key.
 
-        Args:
-            request (Request): The incoming request.
-            api_key (Optional[str]): The API key from the header.
-            authorization (Optional[HTTPAuthorizationCredentials]): The HTTP basic auth credentials.
-            token (Optional[str]): The OAuth2 token.
-            body (Optional[dict | bytes | FormData]): incoming request body got logs
-
-        Returns:
-            AuthenticatedEntity: The authenticated entity.
-
-        Raises:
-            HTTPException: If authentication fails.
+        Bearer tokens and OAuth2 are not supported in this service.
         """
         self.logger.debug("Attempting authentication")
         if token:
-            self.logger.debug("Attempting to authenticate with bearer token")
-            try:
-                return self._verify_bearer_token(token)
-            except HTTPException:
-                raise
-            except Exception:
-                self.logger.exception("Failed to validate token")
-                raise HTTPException(
-                    status_code=401, detail="Invalid authentication credentials"
-                )
+            self.logger.error("Bearer-token authentication is not supported")
+            raise HTTPException(
+                status_code=401, detail="Bearer-token authentication is not supported"
+            )
 
         api_key = self._extract_api_key(request, api_key, authorization)
         # HACK for cloudwatch without api key for self hosted deployments
@@ -193,9 +147,7 @@ class AuthVerifierBase:
         if api_key:
             self.logger.debug("Attempting to authenticate with API key")
             try:
-                return self._verify_api_key(
-                    request, api_key, authorization, session=session
-                )
+                return self._verify_api_key(request, api_key)
             except HTTPException:
                 raise
             except Exception:
@@ -203,8 +155,9 @@ class AuthVerifierBase:
                 raise HTTPException(
                     status_code=401, detail="Invalid authentication credentials"
                 )
+
         self.logger.error(
-            "No valid authentication method found",
+            "No valid authentication method found.",
             extra={
                 "headers": request.headers,
                 "body": body,
@@ -240,7 +193,9 @@ class AuthVerifierBase:
         role = get_role_by_role_name(authenticated_entity.role)
         self.logger.debug(f"Checking scopes for role: {role}")
         if not role.has_scopes(self.scopes):
-            self.logger.warning(f"Authorization failed. Required scopes: {self.scopes}")
+            self.logger.warning(
+                f"Authorization failed. Required scopes: {self.scopes}"
+            )
             raise HTTPException(
                 status_code=403,
                 detail=f"You don't have the required scopes to access this resource [required scopes: {self.scopes}]",
@@ -276,7 +231,9 @@ class AuthVerifierBase:
                 in request.headers.get("user-agent", "")
             ):
                 self.logger.warning("Got an SNS request without any auth")
-                allow_unauth = config("KEEP_CLOUDWATCH_DISABLE_API_KEY", default=False)
+                allow_unauth = config(
+                    "KEEP_CLOUDWATCH_DISABLE_API_KEY", default=False
+                )
                 if allow_unauth and request.url.path.endswith(
                     "/alerts/event/cloudwatch"
                 ):
@@ -307,7 +264,9 @@ class AuthVerifierBase:
                         "user-agent": request.headers.get("user-agent"),
                     },
                 )
-                raise HTTPException(status_code=401, detail="Missing API Key")
+                raise HTTPException(
+                    status_code=401, detail="Missing API Key"
+                )
             if scheme.lower() == "basic":
                 api_key = authorization.password
             elif scheme.lower() == "digest":
@@ -320,7 +279,9 @@ class AuthVerifierBase:
                     api_key = credentials
             else:
                 self.logger.error(f"Unsupported authentication scheme: {scheme}")
-                raise HTTPException(status_code=401, detail="Missing API Key")
+                raise HTTPException(
+                    status_code=401, detail="Missing API Key"
+                )
         self.logger.debug("API key extracted successfully")
         return api_key
 
@@ -329,15 +290,13 @@ class AuthVerifierBase:
         request: Request,
         api_key: str = Security(auth_header),
         authorization: HTTPAuthorizationCredentials = Security(http_basic),
-        session: Optional[Session] = None,
     ) -> AuthenticatedEntity:
         """
-        Verify the API key and return an authenticated entity.
+        Verify the API key against the configured ingestion secret.
 
         Args:
             request (Request): The incoming request.
             api_key (str): The API key to verify.
-            authorization (HTTPAuthorizationCredentials): The HTTP basic auth credentials.
 
         Returns:
             AuthenticatedEntity: The authenticated entity.
@@ -346,114 +305,29 @@ class AuthVerifierBase:
             HTTPException: If the API key is invalid.
         """
         self.logger.debug("Verifying API key")
-        tenant_api_key = get_api_key(api_key, session=session)
-        if not tenant_api_key:
+        # Constant-time comparison to avoid timing side-channels.
+        if not hmac.compare_digest(api_key, self._api_key):
             self.logger.warning("Invalid API Key")
-            raise HTTPException(status_code=401, detail="Invalid API Key")
-        tenant_id = tenant_api_key.tenant_id
-        created_by = tenant_api_key.created_by
-        reference_id = tenant_api_key.reference_id
-        api_key_role = tenant_api_key.role
+            raise HTTPException(
+                status_code=401, detail="Invalid API Key"
+            )
 
-        try:
-            self.logger.debug("Updating API Key last used")
-            # if the key was updated in the last update_key_interval seconds, skip the update
-            if f"{tenant_id}:{reference_id}" in self.key_last_used_updates:
-                # if the key was updated in the last update_key_interval seconds, skip the update
-                if self.key_last_used_updates[f"{tenant_id}:{reference_id}"] > (
-                    datetime.datetime.now()
-                    - datetime.timedelta(seconds=self.update_key_interval)
-                ):
-                    self.logger.debug(
-                        f"API Key last used updated in the last {self.update_key_interval} seconds"
-                    )
-            # else, update the key
-            else:
-                update_key_last_used(
-                    tenant_id, reference_id=reference_id, session=session
-                )
-                self.key_last_used_updates[f"{tenant_id}:{reference_id}"] = (
-                    datetime.datetime.now()
-                )
-            self.logger.debug("Successfully updated API Key last used")
-        except Exception:
-            self.logger.exception("Failed to update API Key last used")
-
+        tenant_id = self._tenant_id
         request.state.tenant_id = tenant_id
         self.logger.debug(f"API key verified for tenant: {tenant_id}")
-        # check if impersonation is enabled, if not, return the api key's authenticated entity
-        if not self.impersonation_enabled:
-            return AuthenticatedEntity(
-                tenant_id,
-                created_by,
-                reference_id,
-                api_key_role,
-            )
-        # check if impersonation headers are present
-        user_name = request.headers.get(self.impersonation_user_header)
-        role = request.headers.get(self.impersonation_role_header)
-        # if not, return the apikey's authenticated entity
-        if not user_name or not role:
-            return AuthenticatedEntity(
-                tenant_id,
-                created_by,
-                reference_id,
-                api_key_role,
-            )
-
-        self.logger.info("Impersonating user")
-        user_name = request.headers.get(self.impersonation_user_header)
-        role = request.headers.get(self.impersonation_role_header)
-        if not user_name or not role:
-            raise HTTPException(status_code=401, detail="Impersonation headers missing")
-
-        # TODO - validate authorization meaning api key X has access to impersonate user Y
-        #        for now, only admin users can impersonate
-        if api_key_role != AdminRole.get_name():
-            self.logger.error("Impersonation not allowed for non-admin users")
-            raise HTTPException(
-                status_code=401, detail="Impersonation not allowed for non-admin users"
-            )
-
-        # auto provision user
-        if self.impersonation_auto_provision:
-            self.logger.info(f"Auto provisioning user: {user_name}")
-            self._provision_user(tenant_id, user_name, role, session=session)
-            self.logger.info(f"User {user_name} provisioned successfully")
-
-        self.logger.info("User impersonated successfully")
         return AuthenticatedEntity(
             tenant_id=tenant_id,
-            email=user_name,
-            api_key_name=None,
-            role=role,
-        )
-
-    def _provision_user(self, tenant_api_key, user_name, role, session=None):
-        """
-        Create a user for impersonation.
-
-        Args:
-            tenant_api_key: The API key used for impersonation.
-            user_name: The name of the user to create.
-            role: The role of the user to create.
-        """
-        raise NotImplementedError(
-            "User provisioning not implemented for {}".format(self.__class__.__name__)
+            email="ingestion",
+            api_key_name="ingestion-secret",
+            role="webhook",
         )
 
     def _verify_bearer_token(self, token: str) -> AuthenticatedEntity:
         """
         Verify the bearer token and return an authenticated entity.
 
-        Args:
-            token (str): The bearer token to verify.
-
-        Returns:
-            AuthenticatedEntity: The authenticated entity.
-
         Raises:
-            NotImplementedError: This method needs to be implemented in subclasses.
+            NotImplementedError: Bearer tokens are not supported by this service.
         """
         self.logger.error("_verify_bearer_token() method not implemented")
         raise NotImplementedError(
@@ -461,4 +335,3 @@ class AuthVerifierBase:
                 self.__class__.__name__
             )
         )
-

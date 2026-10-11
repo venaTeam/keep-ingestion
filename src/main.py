@@ -26,7 +26,6 @@ from src.config.consts import (
     REDIS,
 )
 
-from src.repositories.db import dispose_session
 from src.repositories.dependencies import GENERIC_TENANT_UUID
 from src.utils.limiter import limiter
 from src.utils.logging import CONFIG as logging_config, setup_logging
@@ -100,10 +99,6 @@ async def startup():
     part of it. Leaving it out is what keeps the provider framework, the secret
     managers and the kubernetes client out of this image.
     """
-    logger.info("Disope existing DB connections")
-    # psycopg2.DatabaseError: error with status PGRES_TUPLES_OK and no message from the libpq
-    # https://stackoverflow.com/questions/43944787/sqlalchemy-celery-with-scoped-session-error/54751019#54751019
-    dispose_session()
 
     logger.info("Starting the services")
 
