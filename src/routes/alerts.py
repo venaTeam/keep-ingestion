@@ -59,9 +59,10 @@ def _retry_later(detail: str, **body) -> JSONResponse:
     is still read as a fallback so a chart that sets it keeps working.
 
     `KEEP_ALERT_DLQ_ACCEPT=true` restores the old "202 accepted" contract for
-    senders that must not see an error. The DLQ topic exists, but nothing
-    consumes it, so an alert that lands there is retained and never ingested —
-    which is why the default is to answer 503 and make the sender retry.
+    senders that must not see an error. The DLQ topic is consumed by
+    `keep-reconciler`, which resubmits failed alerts to Keep, so an alert that
+    lands there is retained and recoverable — the default 503 still prompts the
+    sender to retry.
     """
     return JSONResponse(
         content={**body, "detail": detail},
@@ -82,7 +83,8 @@ def _ingestion_response(task_name, source: str) -> JSONResponse:
 
     alert_ingestion_total.labels(source=source, status="dlq").inc()
     logger.error(
-        "Alert diverted to the DLQ topic and will not be ingested", extra=body
+        "Alert diverted to the DLQ topic; keep-reconciler will attempt re-ingestion",
+        extra=body,
     )
 
     if KEEP_ALERT_DLQ_ACCEPT:
@@ -90,7 +92,7 @@ def _ingestion_response(task_name, source: str) -> JSONResponse:
 
     return _retry_later(
         "Alert could not be published to the ingestion topic and was written to "
-        "the dead-letter topic; it will not be processed. Please retry.",
+        "the dead-letter topic; keep-reconciler will attempt re-ingestion. Please retry.",
         **body,
     )
 
@@ -119,6 +121,15 @@ def _publish_failed_response(
         trace_id=trace_id,
     )
 
+
+
+def _dlq_replay_count(request: Request) -> int | None:
+    """The replay number keep-reconciler sends; None for every other sender."""
+    value = request.headers.get("X-Keep-DLQ-Replay")
+    try:
+        return int(value) if value is not None else None
+    except ValueError:
+        return None
 
 
 def _resolve_ingestion_tenant(event) -> str:
@@ -161,6 +172,7 @@ async def receive_generic_event(
             api_key_name=authenticated_entity.api_key_name,
             trace_id=request.state.trace_id,
             provider_name=None,
+            dlq_replay_count=_dlq_replay_count(request),
         )
     except Exception as e:
         return _publish_failed_response(

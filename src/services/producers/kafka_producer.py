@@ -44,6 +44,10 @@ def _create_ssl_context(security_protocol: str, cafile: Optional[str], certfile:
     return ssl_context
 
 
+class ReplayNotDivertedError(RuntimeError):
+    """The main topic is unavailable for a DLQ replay, which is not diverted."""
+
+
 class KafkaEventProducer(EventProducer):
     """Publishes alerts to the ingestion topic, with every wait bounded.
 
@@ -69,9 +73,10 @@ class KafkaEventProducer(EventProducer):
     rather than N; it is rebound per event loop, because this class is a
     module-level singleton and a Lock reused across loops raises.
 
-    **The DLQ fallback is retained but is not a delivery.** Nothing consumes that
-    topic, so `produce()` marks a diverted event via `DLQ_TASK_NAME` and the
-    route answers 503 rather than reporting success.
+    **The DLQ fallback is retained for recovery.** `keep-reconciler` consumes the
+    DLQ topic and resubmits failed alerts to Keep, so `produce()` marks a
+    diverted event via `DLQ_TASK_NAME` and the route answers 503 to prompt the
+    sender to retry while the reconciler handles the failed event.
     """
 
     def __init__(self):
@@ -270,13 +275,37 @@ class KafkaEventProducer(EventProducer):
     def last_produce_result(self) -> Optional[ProduceResult]:
         return self._last_result
 
-    async def _send_to_dlq(self, value: bytes, trace_id: str) -> str:
-        """Divert to the dead-letter topic, and say so.
+    async def _send_to_dlq(
+        self,
+        event: dict,
+        error_message: str,
+        trace_id: str,
+        event_type: EventType,
+        **kwargs,
+    ) -> str:
+        """Divert to the dead-letter topic in a shape the reconciler understands.
 
-        Bounded like the main send. Only the main topic is consumed, so an event
-        that lands here is NOT ingested — the returned task name carries the
-        marker that lets the route answer 503 instead of reporting success.
+        The DLQ payload contains the original ``alert`` plus an ``error`` context
+        with the failure reason, trace id and event type. Extra routing context
+        (tenant, provider, fingerprint, etc.) is preserved as top-level siblings
+        so the reconciler can resubmit with the same ownership/correlation.
         """
+        dlq_payload = {
+            "alert": event,
+            "event_type": event_type.value if hasattr(event_type, "value") else event_type,
+            "error": {
+                "message": error_message,
+                "trace_id": trace_id,
+            },
+            "tenant_id": kwargs.get("tenant_id"),
+            "provider_type": kwargs.get("provider_type"),
+            "provider_id": kwargs.get("provider_id"),
+            "fingerprint": kwargs.get("fingerprint"),
+            "api_key_name": kwargs.get("api_key_name"),
+            "provider_name": kwargs.get("provider_name"),
+        }
+        value = self._serialize_payload(dlq_payload)
+
         try:
             await self.dlq_producer.start()
         except RuntimeError:
@@ -286,8 +315,8 @@ class KafkaEventProducer(EventProducer):
             self.dlq_producer, self.dlq_topic, value, self.send_timeout
         )
         logger.warning(
-            "Produced event to the DLQ topic — it will NOT be ingested by "
-            "keep-event-handler",
+            "Produced event to the DLQ topic — keep-reconciler will attempt "
+            "re-ingestion",
             extra={"dlq_topic": self.dlq_topic, "trace_id": trace_id},
         )
         self._last_result = ProduceResult.DLQ
@@ -306,6 +335,9 @@ class KafkaEventProducer(EventProducer):
             "api_key_name": kwargs.get("api_key_name"),
             "trace_id": kwargs.get("trace_id", "unknown"),
             "provider_name": kwargs.get("provider_name"),
+            # Carried through keep-event-handler so a replay that fails again
+            # reaches the DLQ with its count, and keep-reconciler can stop.
+            "dlq_replay_count": kwargs.get("dlq_replay_count"),
         }
 
     def _serialize_payload(self, payload: dict) -> bytes:
@@ -379,15 +411,22 @@ class KafkaEventProducer(EventProducer):
         return None
 
     async def produce(self, event: dict, event_type: EventType = EventType.ALERT, **kwargs) -> str:
-        trace_id = kwargs.get("trace_id", "unknown")
-        payload = self._build_payload(event, event_type, **kwargs)
+        # Popped so the DLQ helpers, which take trace_id explicitly, don't get it twice.
+        trace_id = kwargs.pop("trace_id", "unknown")
+        payload = self._build_payload(event, event_type, trace_id=trace_id, **kwargs)
         value = self._serialize_payload(payload)
 
         try:
             await self._ensure_started()
         except KafkaConnectionError as e:
             logger.warning(f"Failed to connect to kafka: {e}. Sending directly to DLQ")
-            return await self._send_to_dlq_or_raise(value, trace_id)
+            return await self._send_to_dlq_or_raise(
+                event,
+                f"Failed to connect to Kafka: {e}",
+                trace_id,
+                event_type,
+                **kwargs,
+            )
 
         result = await self._produce_with_retry(value, trace_id)
         if result:
@@ -395,11 +434,31 @@ class KafkaEventProducer(EventProducer):
             return result
 
         logger.warning(f"All {self.max_retries} attempts to main topic {self.topic} failed. Sending to DLQ")
-        return await self._send_to_dlq_or_raise(value, trace_id)
+        return await self._send_to_dlq_or_raise(
+            event,
+            f"Failed to produce to {self.topic} after {self.max_retries} attempts",
+            trace_id,
+            event_type,
+            **kwargs,
+        )
 
-    async def _send_to_dlq_or_raise(self, value: bytes, trace_id: str) -> str:
+    async def _send_to_dlq_or_raise(
+        self,
+        event: dict,
+        error_message: str,
+        trace_id: str,
+        event_type: EventType,
+        **kwargs,
+    ) -> str:
+        if kwargs.get("dlq_replay_count"):
+            # A keep-reconciler replay is still in the DLQ: writing it back would
+            # add a copy on every retry. Fail instead, so the route answers 503
+            # and the reconciler retries the alert it already holds.
+            raise ReplayNotDivertedError(error_message)
         try:
-            return await self._send_to_dlq(value, trace_id)
+            return await self._send_to_dlq(
+                event, error_message, trace_id, event_type, **kwargs
+            )
         except Exception:
             logger.exception("Failed to produce event to DLQ")
             raise

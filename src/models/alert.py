@@ -152,7 +152,7 @@ class AlertDto(BaseModel):
 
             # Fields to exclude from comparison since they are bit different in different db's
             # todo: solve it in a better way
-            exclude_fields = {"last_received", "started_at", "event_id", "timestamp"}
+            exclude_fields = {"last_received", "started_at", "event_id"}
 
             # Remove excluded fields from both dictionaries
             for field in exclude_fields:
@@ -305,7 +305,7 @@ class AlertDto(BaseModel):
         return values
 
     # after root_validator to ensure that the values are set
-    @root_validator(pre=False)
+    @root_validator(pre=False, skip_on_failure=True)
     def validate_status(cls, values: Dict[str, Any]) -> Dict[str, Any]:
         return values
 
