@@ -199,6 +199,40 @@ def test_generic_event_returns_503_when_publish_reaches_no_topic(client_factory)
     assert resp.status_code == 503
 
 
+def test_generic_event_passes_the_reconciler_replay_count(client_factory):
+    client, producer = client_factory(_RecordingProducer())
+    resp = client.post(
+        "/alerts/event",
+        json=_alert_body(),
+        headers={"X-API-KEY": API_KEY, "X-Keep-DLQ-Replay": "2"},
+    )
+
+    assert resp.status_code == 202
+    assert producer.calls[0]["dlq_replay_count"] == 2
+
+
+def test_generic_event_without_replay_header_is_not_a_replay(client_factory):
+    client, producer = client_factory(_RecordingProducer())
+    client.post("/alerts/event", json=_alert_body(), headers={"X-API-KEY": API_KEY})
+
+    assert producer.calls[0]["dlq_replay_count"] is None
+
+
+def test_replay_that_cannot_be_published_answers_503(client_factory):
+    from src.services.producers.kafka_producer import ReplayNotDivertedError
+
+    client, _ = client_factory(
+        _RecordingProducer(raises=ReplayNotDivertedError("main topic down"))
+    )
+    resp = client.post(
+        "/alerts/event",
+        json=_alert_body(),
+        headers={"X-API-KEY": API_KEY, "X-Keep-DLQ-Replay": "1"},
+    )
+
+    assert resp.status_code == 503
+
+
 # --------------------------------------------------------------------------- #
 # POST /alerts/event/{provider_type} - raw body, and the two fixed defects
 # --------------------------------------------------------------------------- #

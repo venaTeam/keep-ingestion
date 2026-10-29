@@ -99,7 +99,7 @@ Kafka:
 | Variable | Default | Notes |
 |---|---|---|
 | `KAFKA_TOPIC` | `keep-events` | Must match what the consumer reads |
-| `KAFKA_DLQ_TOPIC` | `keep-events-dlq` | **Nothing consumes this.** An alert here is retained, never ingested |
+| `KAFKA_DLQ_TOPIC` | `keep-events-dlq` | Consumed by `keep-reconciler` for re-ingestion. An alert here is retained and recoverable |
 | `KAFKA_SECURITY_PROTOCOL` | `PLAINTEXT` | `SASL_*` / `SSL` variants read the `KAFKA_SASL_*` and `KAFKA_SSL_*` vars |
 | `KAFKA_DLQ_BOOTSTRAP_SERVERS` | main brokers | Same cluster by default, so a broker outage takes the DLQ with it |
 
