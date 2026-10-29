@@ -11,7 +11,8 @@ class EventType(str, Enum):
 
 class ProduceResult(str, Enum):
     """Where an event actually landed — a `produce()` that didn't raise may still
-    have fallen back to the DLQ topic, which nothing consumes."""
+    have fallen back to the DLQ topic, which `keep-reconciler` consumes for
+    re-ingestion."""
 
     MAIN = "main"
     DLQ = "dlq"
