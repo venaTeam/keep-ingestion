@@ -22,14 +22,26 @@ def _extract_identity(request: Request, attribute="email") -> str:
         return "anonymous"
 
 
-PROBE_PATHS = frozenset({"/readyz", "/healthcheck"})
+SENSITIVE_HEADERS = frozenset({"authorization", "cookie", "x-api-key"})
+
+
+def _redact_headers(headers) -> dict:
+    return {
+        key: "[REDACTED]" if key.lower() in SENSITIVE_HEADERS else value
+        for key, value in headers.items()
+    }
+
+
+PROBE_PATHS = frozenset(
+    {"/readyz", "/healthcheck", "/metrics", "/metrics/processing"}
+)
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    """Logs the start and end of every request, except the probes.
+    """Logs one line per finished request, except the probes.
 
-    Kubelet hits `PROBE_PATHS` every few seconds on every pod, at two log lines
-    each, and they say nothing worth keeping. Only the logging is skipped for
+    Kubelet and Prometheus hit `PROBE_PATHS` every few seconds on every pod,
+    and they say nothing worth keeping. Only the logging is skipped for
     them — the rest of the middleware still runs, because `request.state.tenant_id`
     is set here and the catch-all exception handler in `main.py` reads it.
     """
@@ -37,15 +49,13 @@ class LoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         identity = _extract_identity(request, attribute="keep_tenant_id")
         is_probe = request.url.path in PROBE_PATHS
-        if not is_probe:
-            logger.info(
-                f"Request started: {request.method} {request.url.path}",
-                extra={"tenant_id": identity},
-            )
 
         # for debugging purposes, log the payload
         if os.environ.get("LOG_AUTH_PAYLOAD", "false") == "true":
-            logger.info(f"Request headers: {request.headers}")
+            logger.debug(
+                "Request headers",
+                extra={"headers": _redact_headers(request.headers)},
+            )
 
         # Default `trace_id` so the ingestion routes can read it unconditionally.
         #
@@ -72,10 +82,14 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         identity = getattr(request.state, "tenant_id", identity)
         if not is_probe:
             logger.info(
-                f"Request finished: {request.method} {request.url.path} {response.status_code} in {end_time - start_time:.2f}s",
+                "Request finished",
                 extra={
-                    "tenant_id": identity,
+                    "method": request.method,
+                    "path": request.url.path,
                     "status_code": response.status_code,
+                    "duration_ms": int((end_time - start_time) * 1000),
+                    "tenant_id": identity,
+                    "trace_id": request.state.trace_id,
                 },
             )
         return response

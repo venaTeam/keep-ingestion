@@ -70,7 +70,9 @@ def _retry_later(detail: str, **body) -> JSONResponse:
     )
 
 
-def _ingestion_response(task_name, source: str) -> JSONResponse:
+def _ingestion_response(
+    task_name, source: str, tenant_id: str | None = None, trace_id: str | None = None
+) -> JSONResponse:
     """Build the ingestion response, labelling the metric by where the event
     actually landed rather than reporting success unconditionally."""
     result = result_from_task_name(task_name)
@@ -82,7 +84,8 @@ def _ingestion_response(task_name, source: str) -> JSONResponse:
 
     alert_ingestion_total.labels(source=source, status="dlq").inc()
     logger.error(
-        "Alert diverted to the DLQ topic and will not be ingested", extra=body
+        "Alert diverted to the DLQ topic and will not be ingested",
+        extra={**body, "source": source, "tenant_id": tenant_id, "trace_id": trace_id},
     )
 
     if KEEP_ALERT_DLQ_ACCEPT:
@@ -96,7 +99,7 @@ def _ingestion_response(task_name, source: str) -> JSONResponse:
 
 
 def _publish_failed_response(
-    exc: Exception, source: str, trace_id: str
+    exc: Exception, source: str, trace_id: str, tenant_id: str | None = None
 ) -> JSONResponse:
     """Answer a publish that reached no topic at all.
 
@@ -110,7 +113,7 @@ def _publish_failed_response(
     ).inc()
     logger.exception(
         "Failed to publish alert to any topic; rejecting so the sender retries",
-        extra={"trace_id": trace_id, "source": source},
+        extra={"trace_id": trace_id, "source": source, "tenant_id": tenant_id},
     )
     # trace_id travels in the body so a sender reporting a 503 gives us something
     # to grep for.
@@ -164,10 +167,15 @@ async def receive_generic_event(
         )
     except Exception as e:
         return _publish_failed_response(
-            e, source="generic", trace_id=request.state.trace_id
+            e, source="generic", trace_id=request.state.trace_id, tenant_id=tenant_id
         )
 
-    return _ingestion_response(task_name, source="generic")
+    return _ingestion_response(
+        task_name,
+        source="generic",
+        tenant_id=tenant_id,
+        trace_id=request.state.trace_id,
+    )
 
 
 # https://learn.netdata.cloud/docs/alerts-&-notifications/notifications/centralized-cloud-notifications/webhook#challenge-secret
@@ -249,9 +257,13 @@ async def receive_event(
             provider_name=provider_name,
         )
     except Exception as e:
-        return _publish_failed_response(e, source=provider_type, trace_id=trace_id)
+        return _publish_failed_response(
+            e, source=provider_type, trace_id=trace_id, tenant_id=tenant_id
+        )
 
     if not task_name:
         task_name = "async-task"
 
-    return _ingestion_response(task_name, source=provider_type)
+    return _ingestion_response(
+        task_name, source=provider_type, tenant_id=tenant_id, trace_id=trace_id
+    )
