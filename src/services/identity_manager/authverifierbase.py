@@ -100,8 +100,6 @@ class AuthVerifierBase:
         Raises:
             HTTPException: If authentication or authorization fails.
         """
-        self.logger.debug("Starting authentication process")
-
         authenticated_entity = self.authenticate(
             request,
             api_key,
@@ -109,13 +107,7 @@ class AuthVerifierBase:
             token,
             body=body,
         )
-        self.logger.debug(
-            f"Authentication successful for entity: {authenticated_entity}"
-        )
-
-        self.logger.debug("Starting authorization process")
         self.authorize(authenticated_entity)
-        self.logger.debug("Authorization successful")
 
         return authenticated_entity
 
@@ -132,7 +124,6 @@ class AuthVerifierBase:
 
         Bearer tokens and OAuth2 are not supported in this service.
         """
-        self.logger.debug("Attempting authentication")
         if token:
             self.logger.error("Bearer-token authentication is not supported")
             raise HTTPException(
@@ -145,7 +136,6 @@ class AuthVerifierBase:
             return api_key
 
         if api_key:
-            self.logger.debug("Attempting to authenticate with API key")
             try:
                 return self._verify_api_key(request, api_key)
             except HTTPException:
@@ -156,12 +146,9 @@ class AuthVerifierBase:
                     status_code=401, detail="Invalid authentication credentials"
                 )
 
-        self.logger.error(
+        self.logger.warning(
             "No valid authentication method found.",
-            extra={
-                "headers": request.headers,
-                "body": body,
-            },
+            extra={"path": request.url.path},
         )
         raise HTTPException(
             status_code=401, detail="Missing authentication credentials"
@@ -177,7 +164,6 @@ class AuthVerifierBase:
         Raises:
             HTTPException: If authorization fails.
         """
-        self.logger.debug(f"Authorizing entity: {authenticated_entity}")
         self._authorize(authenticated_entity)
 
     def _authorize(self, authenticated_entity: AuthenticatedEntity) -> None:
@@ -191,10 +177,13 @@ class AuthVerifierBase:
             HTTPException: If the entity doesn't have the required scopes.
         """
         role = get_role_by_role_name(authenticated_entity.role)
-        self.logger.debug(f"Checking scopes for role: {role}")
         if not role.has_scopes(self.scopes):
             self.logger.warning(
-                f"Authorization failed. Required scopes: {self.scopes}"
+                "Authorization failed. Required scopes",
+                extra={
+                    "tenant_id": authenticated_entity.tenant_id,
+                    "required_scopes": self.scopes,
+                },
             )
             raise HTTPException(
                 status_code=403,
@@ -221,7 +210,6 @@ class AuthVerifierBase:
         Raises:
             HTTPException: If no valid API key is found.
         """
-        self.logger.debug("Extracting API key")
         api_key = api_key or request.query_params.get("api_key", None)
         if not api_key:
             # A special treatment for CloudWatch SNS Confirmation requests
@@ -239,7 +227,8 @@ class AuthVerifierBase:
                 ):
                     tenant_id = request.query_params.get("tenant_id", "keep")
                     self.logger.info(
-                        f"Allowing unauthenticated access for tenant: {tenant_id} for CloudWatch"
+                        "Allowing unauthenticated access for CloudWatch",
+                        extra={"tenant_id": tenant_id},
                     )
                     return AuthenticatedEntity(
                         tenant_id=tenant_id,
@@ -278,11 +267,12 @@ class AuthVerifierBase:
                 else:
                     api_key = credentials
             else:
-                self.logger.error(f"Unsupported authentication scheme: {scheme}")
+                self.logger.error(
+                    "Unsupported authentication scheme", extra={"scheme": scheme}
+                )
                 raise HTTPException(
                     status_code=401, detail="Missing API Key"
                 )
-        self.logger.debug("API key extracted successfully")
         return api_key
 
     def _verify_api_key(
@@ -304,7 +294,6 @@ class AuthVerifierBase:
         Raises:
             HTTPException: If the API key is invalid.
         """
-        self.logger.debug("Verifying API key")
         # Constant-time comparison to avoid timing side-channels.
         if not hmac.compare_digest(api_key, self._api_key):
             self.logger.warning("Invalid API Key")
@@ -314,7 +303,6 @@ class AuthVerifierBase:
 
         tenant_id = self._tenant_id
         request.state.tenant_id = tenant_id
-        self.logger.debug(f"API key verified for tenant: {tenant_id}")
         return AuthenticatedEntity(
             tenant_id=tenant_id,
             email="ingestion",

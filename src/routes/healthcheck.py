@@ -66,18 +66,22 @@ async def _check_producer() -> tuple[bool, dict]:
     try:
         healthy, detail = await producer.health(attempt_reconnect=True)
     except Exception as exc:
-        logger.error("Producer health check failed with exception: %s", exc, exc_info=True)
+        logger.exception(
+            "Producer health check failed with exception", extra={"error": str(exc)}
+        )
         return False, {"created": True, "error": f"{type(exc).__name__}: {exc}"}
 
     detail["created"] = True
     if not healthy:
         logger.error(
-            "Producer check failed: %s",
-            detail.get("last_error") or "not connected",
-            extra={"producer": detail},
+            "Producer check failed",
+            extra={
+                "error": detail.get("last_error") or "not connected",
+                "producer": detail,
+            },
         )
     else:
-        logger.info("Producer readiness check passed", extra={"producer": detail})
+        logger.debug("Producer readiness check passed", extra={"producer": detail})
     return healthy, detail
 
 
@@ -101,17 +105,18 @@ async def _bounded(awaitable, name: str) -> tuple[bool, dict]:
     if not done:
         task.cancel()
         task.add_done_callback(_discard)
-        logger.error("Readiness check '%s' timed out after %ss", name, READYZ_CHECK_TIMEOUT)
+        logger.error(
+            "Readiness check timed out",
+            extra={"check": name, "timeout_s": READYZ_CHECK_TIMEOUT},
+        )
         return False, {"error": f"{name} check timed out after {READYZ_CHECK_TIMEOUT}s"}
 
     try:
         return task.result()
     except Exception as exc:
-        logger.error(
-            "Readiness check '%s' failed with unhandled exception: %s",
-            name,
-            exc,
-            exc_info=True,
+        logger.exception(
+            "Readiness check failed with unhandled exception",
+            extra={"check": name, "error": str(exc)},
         )
         return False, {"error": f"{type(exc).__name__}: {exc}"}
 
@@ -154,12 +159,12 @@ async def readyz(response: Response) -> dict:
             else:
                 reasons.append("producer unhealthy")
 
-        reason_str = f": {'; '.join(reasons)}" if reasons else ""
-        logger.error(f"Readiness check failed {reason_str}", extra={"checks": checks})
+        logger.error(
+            "Readiness check failed",
+            extra={"reason": "; ".join(reasons), "checks": checks},
+        )
     else:
         logger.debug("Readiness check passed", extra={"checks": checks})
-
-    logger.debug("Readiness check passed", extra={"checks": checks})
 
     return {"status": "ok" if ready else "unavailable", "checks": checks}
 

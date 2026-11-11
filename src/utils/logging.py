@@ -1,4 +1,3 @@
-import http.client
 import inspect
 import logging
 import logging.config
@@ -253,7 +252,7 @@ CONFIG = {
     "loggers": {
         "": {
             "handlers": ["default"],
-            "level": "DEBUG",
+            "level": LOG_LEVEL,
             "propagate": False,
         },
         "slowapi": {
@@ -261,9 +260,9 @@ CONFIG = {
             "level": LOG_LEVEL,
             "propagate": False,
         },
-        "uvicorn.access": {  # Add uvicorn.access logger configuration
-            "handlers": ["uvicorn_access"],
-            "level": get_gunicorn_log_level(),
+        "uvicorn.access": {
+            "handlers": [],
+            "level": "WARNING",
             "propagate": False,
         },
         "uvicorn.error": {  # Add uvicorn.error logger configuration
@@ -300,11 +299,6 @@ CONFIG = {
         "httpx": {
             "handlers": [],
             "level": "ERROR",
-            "propagate": False,
-        },
-        "http.client": {
-            "handlers": ["default"],
-            "level": "DEBUG",
             "propagate": False,
         },
     },
@@ -404,10 +398,9 @@ def setup_logging():
         # Add file handler to root logger
         CONFIG["loggers"][""]["handlers"].append("file")
 
-    # Add fluentbit handler if KEEP_FLUENTBIT is set
-    if KEEP_FLUENTBIT:
+    if KEEP_FLUENTBIT and KEEP_FLUENTBIT_HOST:
         CONFIG["handlers"]["fluentbit"] = {
-            "level": "DEBUG",
+            "level": LOG_LEVEL,
             "formatter": ("json"),
             "class": "src.utils.logging.FluentBitHandler",
             "host": KEEP_FLUENTBIT_HOST,
@@ -417,16 +410,4 @@ def setup_logging():
         CONFIG["loggers"][""]["handlers"].append("fluentbit")
 
     logging.config.dictConfig(CONFIG)
-    # MONKEY PATCHING http.client
-    # See: https://stackoverflow.com/questions/58738195/python-http-request-and-debug-level-logging-to-the-log-file
-    http_client_logger = logging.getLogger("http.client")
-    http_client_logger.setLevel(logging.DEBUG)
-    http.client.HTTPConnection.debuglevel = 1
-
-    def print_to_log(*args):
-        http_client_logger.debug(" ".join(args))
-
-    # monkey-patch a `print` global into the http.client module; all calls to
-    # print() in that module will then use our print_to_log implementation
-    http.client.print = print_to_log
 

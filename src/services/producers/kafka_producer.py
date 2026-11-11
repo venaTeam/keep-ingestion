@@ -165,10 +165,12 @@ class KafkaEventProducer(EventProducer):
             except Exception as exc:
                 self._last_start_error = f"main topic '{self.topic}': {type(exc).__name__}: {exc}"
                 logger.error(
-                    "Failed to connect Kafka main producer (topic: %s, servers: %s): %s",
-                    self.topic,
-                    self.bootstrap_servers,
-                    exc,
+                    "Failed to connect Kafka main producer",
+                    extra={
+                        "topic": self.topic,
+                        "bootstrap_servers": self.bootstrap_servers,
+                        "error": str(exc),
+                    },
                 )
                 raise
 
@@ -177,10 +179,12 @@ class KafkaEventProducer(EventProducer):
             except Exception as exc:
                 self._last_start_error = f"DLQ topic '{self.dlq_topic}': {type(exc).__name__}: {exc}"
                 logger.error(
-                    "Failed to connect Kafka DLQ producer (topic: %s, servers: %s): %s",
-                    self.dlq_topic,
-                    self.dlq_bootstrap_servers,
-                    exc,
+                    "Failed to connect Kafka DLQ producer",
+                    extra={
+                        "topic": self.dlq_topic,
+                        "bootstrap_servers": self.dlq_bootstrap_servers,
+                        "error": str(exc),
+                    },
                 )
                 raise
 
@@ -224,12 +228,13 @@ class KafkaEventProducer(EventProducer):
                 await asyncio.wait_for(producer.stop(), timeout=self.stop_timeout)
             except asyncio.TimeoutError:
                 logger.warning(
-                    "Timed out closing the %s Kafka producer after %ss",
-                    name,
-                    self.stop_timeout,
+                    "Timed out closing the Kafka producer",
+                    extra={"producer": name, "timeout_s": self.stop_timeout},
                 )
             except Exception:
-                logger.exception("Failed to close the %s Kafka producer", name)
+                logger.exception(
+                    "Failed to close the Kafka producer", extra={"producer": name}
+                )
         self._started = False
 
     async def health(self, attempt_reconnect: bool = False) -> tuple[bool, dict]:
@@ -250,7 +255,8 @@ class KafkaEventProducer(EventProducer):
                 )
             except Exception:
                 logger.warning(
-                    "Kafka producer still not connected: %s", self._last_start_error
+                    "Kafka producer still not connected",
+                    extra={"error": self._last_start_error},
                 )
 
         detail = {
@@ -315,7 +321,10 @@ class KafkaEventProducer(EventProducer):
                 payload, default=lambda o: o.dict() if hasattr(o, "dict") else str(o)
             ).encode("utf-8")
         except Exception:
-            logger.exception("Failed to serialize event payload")
+            logger.exception(
+                "Failed to serialize event payload",
+                extra={"trace_id": payload.get("trace_id")},
+            )
             raise
 
     async def _send_bounded(self, producer, topic: str, value: bytes, timeout: float):
@@ -345,11 +354,13 @@ class KafkaEventProducer(EventProducer):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 logger.warning(
-                    "Produce budget of %ss exhausted after %s attempt(s) to %s: %s",
-                    self.produce_timeout,
-                    attempt,
-                    self.topic,
-                    trace_id,
+                    "Produce budget exhausted",
+                    extra={
+                        "budget_s": self.produce_timeout,
+                        "attempts": attempt,
+                        "topic": self.topic,
+                        "trace_id": trace_id,
+                    },
                 )
                 break
 
@@ -357,18 +368,34 @@ class KafkaEventProducer(EventProducer):
                 await self._send_bounded(
                     self.producer, self.topic, value, min(self.send_timeout, remaining)
                 )
-                logger.info(f"Successfully produced event to Kafka topic {self.topic}: {trace_id}")
+                logger.debug(
+                    "Produced event to Kafka topic",
+                    extra={"topic": self.topic, "trace_id": trace_id},
+                )
 
                 return MAIN_TASK_NAME
             except asyncio.TimeoutError:
                 logger.warning(
-                    f"Timed out producing to Kafka main topic {self.topic} "
-                    f"(attempt {attempt + 1}/{self.max_retries}, "
-                    f"limit {self.send_timeout}s): {trace_id}"
+                    "Timed out producing to Kafka main topic",
+                    extra={
+                        "topic": self.topic,
+                        "attempt": attempt + 1,
+                        "max_retries": self.max_retries,
+                        "timeout_s": self.send_timeout,
+                        "trace_id": trace_id,
+                    },
                 )
             except Exception as e:
                 logger.warning(
-                    f"Failed to produce to Kafka main topic {self.topic} (attempt {attempt + 1}/{self.max_retries}): {e}")
+                    "Failed to produce to Kafka main topic",
+                    extra={
+                        "topic": self.topic,
+                        "attempt": attempt + 1,
+                        "max_retries": self.max_retries,
+                        "error": str(e),
+                        "trace_id": trace_id,
+                    },
+                )
 
             if attempt < self.max_retries - 1:
                 pause = min(backoff, max(0.0, deadline - time.monotonic()))
@@ -386,7 +413,10 @@ class KafkaEventProducer(EventProducer):
         try:
             await self._ensure_started()
         except KafkaConnectionError as e:
-            logger.warning(f"Failed to connect to kafka: {e}. Sending directly to DLQ")
+            logger.warning(
+                "Failed to connect to kafka, sending directly to DLQ",
+                extra={"error": str(e), "trace_id": trace_id},
+            )
             return await self._send_to_dlq_or_raise(value, trace_id)
 
         result = await self._produce_with_retry(value, trace_id)
@@ -394,14 +424,23 @@ class KafkaEventProducer(EventProducer):
             self._last_result = ProduceResult.MAIN
             return result
 
-        logger.warning(f"All {self.max_retries} attempts to main topic {self.topic} failed. Sending to DLQ")
+        logger.warning(
+            "All attempts to main topic failed, sending to DLQ",
+            extra={
+                "topic": self.topic,
+                "max_retries": self.max_retries,
+                "trace_id": trace_id,
+            },
+        )
         return await self._send_to_dlq_or_raise(value, trace_id)
 
     async def _send_to_dlq_or_raise(self, value: bytes, trace_id: str) -> str:
         try:
             return await self._send_to_dlq(value, trace_id)
         except Exception:
-            logger.exception("Failed to produce event to DLQ")
+            logger.exception(
+                "Failed to produce event to DLQ", extra={"trace_id": trace_id}
+            )
             raise
 
     async def close(self):
