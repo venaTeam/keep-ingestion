@@ -8,9 +8,8 @@ import uvicorn
 from contextlib import asynccontextmanager
 
 from dotenv import find_dotenv, load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -29,7 +28,7 @@ from src.config.consts import (
 from src.repositories.dependencies import GENERIC_TENANT_UUID
 from src.utils.limiter import limiter
 from src.utils.logging import CONFIG as logging_config, setup_logging
-from src.middlewares import LoggingMiddleware
+from src.middlewares import LoggingMiddleware, catch_exception
 from src.routes.router_setup import setup_routers
 from src.services.producers.factory import start_event_producer, stop_event_producer
 from src.services.identity_manager.identitymanagerfactory import (
@@ -204,23 +203,12 @@ def get_app(
     # this service: senders authenticate per-request with an API key, so there is
     # no identity manager to start and nothing to mount.
 
-    @app.exception_handler(Exception)
-    async def catch_exception(request: Request, exc: Exception):
-        logging.error(
-            f"An unhandled exception occurred: {exc}, Trace ID: {request.state.trace_id}. Tenant ID: {request.state.tenant_id}"
-        )
-        return JSONResponse(
-            status_code=500,
-            content={
-                "message": "An internal server error occurred.",
-                "trace_id": request.state.trace_id,
-                "error_msg": str(exc),
-            },
-        )
+    app.add_exception_handler(Exception, catch_exception)
 
-    app.add_middleware(LoggingMiddleware)
     if KEEP_USE_LIMITER:
         app.add_middleware(SlowAPIMiddleware)
+    # added after SlowAPIMiddleware so it wraps it and logs its 429s
+    app.add_middleware(LoggingMiddleware)
 
     if KEEP_METRICS:
         instrumentator = Instrumentator(
