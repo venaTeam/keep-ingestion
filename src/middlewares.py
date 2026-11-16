@@ -4,6 +4,7 @@ import time
 
 import jwt
 from fastapi import Request
+from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 logger = logging.getLogger(__name__)
@@ -22,22 +23,28 @@ def _extract_identity(request: Request, attribute="email") -> str:
         return "anonymous"
 
 
-SENSITIVE_HEADERS = frozenset(
-    {
-        "authorization",
-        "proxy-authorization",
-        "cookie",
-        "x-api-key",
-        "x-keep-notify-token",
-        "x-forwarded-access-token",
-        "x-auth-request-access-token",
-    }
+# Header names containing any of these are redacted (auth headers, API keys,
+# webhook tokens and signatures such as X-Gitlab-Token or X-Hub-Signature-256).
+SENSITIVE_HEADER_PARTS = (
+    "auth",
+    "token",
+    "secret",
+    "signature",
+    "key",
+    "cookie",
+    "password",
+    "session",
 )
+
+
+def _is_sensitive_header(name: str) -> bool:
+    name = name.lower()
+    return any(part in name for part in SENSITIVE_HEADER_PARTS)
 
 
 def _redact_headers(headers) -> dict:
     return {
-        key: "[REDACTED]" if key.lower() in SENSITIVE_HEADERS else value
+        key: "[REDACTED]" if _is_sensitive_header(key) else value
         for key, value in headers.items()
     }
 

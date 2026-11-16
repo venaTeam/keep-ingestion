@@ -68,7 +68,6 @@ def get_gunicorn_log_level():
 
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
-KEEP_LOG_FILE = os.environ.get("KEEP_LOG_FILE", "false").lower() == "true"
 KEEP_FLUENTBIT = os.environ.get("KEEP_FLUENTBIT", "true").lower() == "true"
 KEEP_FLUENTBIT_HOST = os.environ.get("KEEP_FLUENTBIT_HOST")
 KEEP_FLUENTBIT_PORT = os.environ.get("KEEP_FLUENTBIT_PORT", "80")
@@ -76,6 +75,13 @@ LOG_FORMAT_OPEN_TELEMETRY = "open_telemetry"
 LOG_FORMAT_DEVELOPMENT_TERMINAL = "dev_terminal"
 
 LOG_FORMAT = os.environ.get("LOG_FORMAT", LOG_FORMAT_OPEN_TELEMETRY)
+
+
+class DropUvicornASGIExceptionFilter(logging.Filter):
+    """Drop uvicorn's duplicate traceback; catch_exception logs it with context."""
+
+    def filter(self, record):
+        return not str(record.msg).startswith("Exception in ASGI application")
 
 
 class OtelFieldsFilter(logging.Filter):
@@ -248,6 +254,7 @@ CONFIG = {
         # Runs before formatting, so the OTEL fields are present whether or not
         # KEEP_OTEL_ENABLED is set. See OtelFieldsFilter.
         "otel_fields": {"()": OtelFieldsFilter},
+        "drop_asgi_exception": {"()": DropUvicornASGIExceptionFilter},
     },
     "loggers": {
         "": {
@@ -268,6 +275,7 @@ CONFIG = {
         "uvicorn.error": {  # Add uvicorn.error logger configuration
             "()": "CustomizedUvicornLogger",  # Use custom logger class
             "handlers": ["default"],
+            "filters": ["drop_asgi_exception"],
             "level": get_gunicorn_log_level(),
             "propagate": False,
         },
@@ -383,21 +391,6 @@ class CustomizedUvicornLogger(logging.Logger):
 
 
 def setup_logging():
-    # Add file handler if KEEP_LOG_FILE is set
-    # TODO: remove this after we move to fluentbit
-    if KEEP_LOG_FILE:
-        CONFIG["handlers"]["file"] = {
-            "level": "DEBUG",
-            "formatter": ("json"),
-            "class": "logging.handlers.RotatingFileHandler",
-            "filename": KEEP_LOG_FILE,
-            "mode": "a",
-            "maxBytes": 1024 * 1024 * 1024,  # 1GB
-            "backupCount": 5,
-        }
-        # Add file handler to root logger
-        CONFIG["loggers"][""]["handlers"].append("file")
-
     if KEEP_FLUENTBIT and KEEP_FLUENTBIT_HOST:
         CONFIG["handlers"]["fluentbit"] = {
             "level": LOG_LEVEL,
