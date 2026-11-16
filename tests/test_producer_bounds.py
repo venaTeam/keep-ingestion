@@ -14,7 +14,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.services.producers.base_event_handler import DLQ_TASK_NAME, MAIN_TASK_NAME
+from src.services.producers.base_event_handler import (
+    DLQ_TASK_NAME,
+    MAIN_TASK_NAME,
+    EventType,
+)
 from src.services.producers.kafka_producer import KafkaEventProducer
 
 
@@ -157,7 +161,7 @@ async def test_dlq_send_is_bounded_too():
 
     started = time.monotonic()
     with pytest.raises(asyncio.TimeoutError):
-        await producer._send_to_dlq(b"payload", "trace-1")
+        await producer._send_to_dlq({"a": 1}, "boom", "trace-1", EventType.ALERT)
     elapsed = time.monotonic() - started
 
     assert elapsed < 1.0
