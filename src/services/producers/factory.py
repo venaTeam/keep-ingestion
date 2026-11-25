@@ -20,7 +20,10 @@ async def get_event_producer() -> EventProducer:
     global _kafka_producer_instance
 
     if messaging_type != "KAFKA":
-        logger.warning(f"Unknown MESSAGING_TYPE: {messaging_type}, defaulting to KAFKA")
+        logger.warning(
+            "Unknown MESSAGING_TYPE, defaulting to KAFKA",
+            extra={"messaging_type": messaging_type},
+        )
 
     if _kafka_producer_instance is None:
         _kafka_producer_instance = KafkaEventProducer()

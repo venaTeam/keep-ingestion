@@ -1,4 +1,3 @@
-import http.client
 import inspect
 import logging
 import logging.config
@@ -69,7 +68,6 @@ def get_gunicorn_log_level():
 
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
-KEEP_LOG_FILE = os.environ.get("KEEP_LOG_FILE", "false").lower() == "true"
 KEEP_FLUENTBIT = os.environ.get("KEEP_FLUENTBIT", "true").lower() == "true"
 KEEP_FLUENTBIT_HOST = os.environ.get("KEEP_FLUENTBIT_HOST")
 KEEP_FLUENTBIT_PORT = os.environ.get("KEEP_FLUENTBIT_PORT", "80")
@@ -77,6 +75,13 @@ LOG_FORMAT_OPEN_TELEMETRY = "open_telemetry"
 LOG_FORMAT_DEVELOPMENT_TERMINAL = "dev_terminal"
 
 LOG_FORMAT = os.environ.get("LOG_FORMAT", LOG_FORMAT_OPEN_TELEMETRY)
+
+
+class DropUvicornASGIExceptionFilter(logging.Filter):
+    """Drop uvicorn's duplicate traceback; catch_exception logs it with context."""
+
+    def filter(self, record):
+        return not str(record.msg).startswith("Exception in ASGI application")
 
 
 class OtelFieldsFilter(logging.Filter):
@@ -249,11 +254,12 @@ CONFIG = {
         # Runs before formatting, so the OTEL fields are present whether or not
         # KEEP_OTEL_ENABLED is set. See OtelFieldsFilter.
         "otel_fields": {"()": OtelFieldsFilter},
+        "drop_asgi_exception": {"()": DropUvicornASGIExceptionFilter},
     },
     "loggers": {
         "": {
             "handlers": ["default"],
-            "level": "DEBUG",
+            "level": LOG_LEVEL,
             "propagate": False,
         },
         "slowapi": {
@@ -261,14 +267,15 @@ CONFIG = {
             "level": LOG_LEVEL,
             "propagate": False,
         },
-        "uvicorn.access": {  # Add uvicorn.access logger configuration
-            "handlers": ["uvicorn_access"],
-            "level": get_gunicorn_log_level(),
+        "uvicorn.access": {
+            "handlers": [],
+            "level": "WARNING",
             "propagate": False,
         },
         "uvicorn.error": {  # Add uvicorn.error logger configuration
             "()": "CustomizedUvicornLogger",  # Use custom logger class
             "handlers": ["default"],
+            "filters": ["drop_asgi_exception"],
             "level": get_gunicorn_log_level(),
             "propagate": False,
         },
@@ -300,11 +307,6 @@ CONFIG = {
         "httpx": {
             "handlers": [],
             "level": "ERROR",
-            "propagate": False,
-        },
-        "http.client": {
-            "handlers": ["default"],
-            "level": "DEBUG",
             "propagate": False,
         },
     },
@@ -389,25 +391,9 @@ class CustomizedUvicornLogger(logging.Logger):
 
 
 def setup_logging():
-    # Add file handler if KEEP_LOG_FILE is set
-    # TODO: remove this after we move to fluentbit
-    if KEEP_LOG_FILE:
-        CONFIG["handlers"]["file"] = {
-            "level": "DEBUG",
-            "formatter": ("json"),
-            "class": "logging.handlers.RotatingFileHandler",
-            "filename": KEEP_LOG_FILE,
-            "mode": "a",
-            "maxBytes": 1024 * 1024 * 1024,  # 1GB
-            "backupCount": 5,
-        }
-        # Add file handler to root logger
-        CONFIG["loggers"][""]["handlers"].append("file")
-
-    # Add fluentbit handler if KEEP_FLUENTBIT is set
-    if KEEP_FLUENTBIT:
+    if KEEP_FLUENTBIT and KEEP_FLUENTBIT_HOST:
         CONFIG["handlers"]["fluentbit"] = {
-            "level": "DEBUG",
+            "level": LOG_LEVEL,
             "formatter": ("json"),
             "class": "src.utils.logging.FluentBitHandler",
             "host": KEEP_FLUENTBIT_HOST,
@@ -417,16 +403,4 @@ def setup_logging():
         CONFIG["loggers"][""]["handlers"].append("fluentbit")
 
     logging.config.dictConfig(CONFIG)
-    # MONKEY PATCHING http.client
-    # See: https://stackoverflow.com/questions/58738195/python-http-request-and-debug-level-logging-to-the-log-file
-    http_client_logger = logging.getLogger("http.client")
-    http_client_logger.setLevel(logging.DEBUG)
-    http.client.HTTPConnection.debuglevel = 1
-
-    def print_to_log(*args):
-        http_client_logger.debug(" ".join(args))
-
-    # monkey-patch a `print` global into the http.client module; all calls to
-    # print() in that module will then use our print_to_log implementation
-    http.client.print = print_to_log
 
